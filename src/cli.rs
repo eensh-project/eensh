@@ -7,11 +7,12 @@
 //! documented, and every rejection is a structured [`Error::InvalidArguments`].
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 
 use crate::capture::CaptureRequest;
+use crate::compare::{CompareMode, CompareOptions};
 use crate::encode::{jpeg, ImageFormat, PngEffort};
 use crate::error::Error;
 use crate::geometry::Rect;
@@ -39,6 +40,58 @@ pub struct Cli {
 pub enum Command {
     /// Capture an image and write it to a file, stdout, or a JSON response.
     Capture(Box<CaptureArgs>),
+    /// Compare two saved images and report what changed.
+    Diff(Box<DiffArgs>),
+}
+
+/// Arguments for `eensh diff`.
+///
+/// The two inputs are decoded from PNG or JPEG at this boundary; everything
+/// below operates on raw frames. See [`crate::compare`].
+#[derive(Debug, Args)]
+pub struct DiffArgs {
+    /// The earlier image.
+    #[arg(value_name = "BEFORE")]
+    pub before: String,
+
+    /// The later image.
+    #[arg(value_name = "AFTER")]
+    pub after: String,
+
+    /// Comparison mode: `exact` or `rgb`.
+    ///
+    /// `exact` counts any channel difference. `rgb` ignores differences up to
+    /// `--pixel-threshold`.
+    #[arg(long, value_name = "MODE")]
+    pub mode: Option<String>,
+
+    /// Largest per-channel difference still considered unchanged, 0-255.
+    #[arg(long, value_name = "0-255", value_parser = clap::value_parser!(u8))]
+    pub pixel_threshold: Option<u8>,
+
+    /// Smallest changed fraction still considered meaningful change, 0.0-1.0.
+    #[arg(long, value_name = "0.0-1.0", value_parser = parse_area_threshold)]
+    pub area_threshold: Option<f64>,
+
+    /// Write a crop of the changed region from the second image to this path.
+    ///
+    /// When nothing changed, no file is written and the JSON reports
+    /// `"changed_crop": null`.
+    #[arg(long, value_name = "PATH")]
+    pub changed_crop: Option<String>,
+
+    /// Image format for the changed crop: `png` or `jpeg`. Inferred from the
+    /// crop path's extension when omitted.
+    #[arg(long, value_name = "FORMAT")]
+    pub crop_format: Option<String>,
+
+    /// Emit a stable JSON response instead of a human readable summary.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Print per-stage timings to stderr.
+    #[arg(long)]
+    pub time: bool,
 }
 
 /// Arguments for `eensh capture`.
@@ -358,6 +411,91 @@ fn parse_scale(text: &str) -> Result<f64, String> {
     Ok(value)
 }
 
+/// Parse an area threshold in `0.0..=1.0`.
+fn parse_area_threshold(text: &str) -> Result<f64, String> {
+    let value = text
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| format!("{text:?} is not a number"))?;
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(format!(
+            "area threshold must be between 0.0 and 1.0, got {text}"
+        ));
+    }
+    Ok(value)
+}
+
+impl DiffArgs {
+    /// Resolve these arguments into an executable configuration.
+    pub fn resolve(&self) -> Result<ResolvedDiff, Error> {
+        let mode = match self.mode.as_deref() {
+            Some(name) => CompareMode::from_name(name)?,
+            // Defaulting to `exact` means options are opt-in: with no flags, the
+            // question answered is "did anything at all differ".
+            None => CompareMode::Exact,
+        };
+
+        let pixel_threshold = self.pixel_threshold.unwrap_or(0);
+        let area_threshold = self.area_threshold.unwrap_or(0.0);
+
+        let options = CompareOptions {
+            mode,
+            pixel_threshold,
+            area_threshold,
+        };
+        options.validate()?;
+
+        let crop = match self.changed_crop.as_deref() {
+            None => None,
+            Some(path) => {
+                let format = match self.crop_format.as_deref() {
+                    Some(name) => ImageFormat::from_name(name)?,
+                    None => ImageFormat::from_path(Path::new(path)).unwrap_or(ImageFormat::Png),
+                };
+                Some(ChangedCropRequest {
+                    path: PathBuf::from(path),
+                    format,
+                })
+            }
+        };
+
+        Ok(ResolvedDiff {
+            before: PathBuf::from(&self.before),
+            after: PathBuf::from(&self.after),
+            options,
+            crop,
+            json: self.json,
+            print_timing: self.time,
+        })
+    }
+}
+
+/// A request to write the changed region of the second frame to disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedCropRequest {
+    /// Destination path.
+    pub path: PathBuf,
+    /// Image format to encode the crop in.
+    pub format: ImageFormat,
+}
+
+/// A fully resolved diff, ready to execute.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedDiff {
+    /// Path to the earlier image.
+    pub before: PathBuf,
+    /// Path to the later image.
+    pub after: PathBuf,
+    /// Comparison settings.
+    pub options: CompareOptions,
+    /// Optional changed-region crop.
+    pub crop: Option<ChangedCropRequest>,
+    /// Whether to emit JSON.
+    pub json: bool,
+    /// Whether to print timings to stderr.
+    pub print_timing: bool,
+}
+
 /// Convenience for callers that only have a bare argument list (used by tests).
 pub fn parse_from<I, T>(arguments: I) -> Result<Cli, clap::Error>
 where
@@ -378,6 +516,17 @@ mod tests {
         let cli = Cli::try_parse_from(argv).expect("arguments should parse");
         match cli.command {
             Command::Capture(args) => *args,
+            other => panic!("expected a capture command, got {other:?}"),
+        }
+    }
+
+    fn diff_args(extra: &[&str]) -> DiffArgs {
+        let mut argv = vec!["eensh", "diff", "before.png", "after.png"];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).expect("arguments should parse");
+        match cli.command {
+            Command::Diff(args) => *args,
+            other => panic!("expected a diff command, got {other:?}"),
         }
     }
 
@@ -585,5 +734,152 @@ mod tests {
             ResizeRequest::Scale(0.5)
         );
         assert!(args(&[]).resolve().unwrap().resize.is_none());
+    }
+
+    // --- diff argument resolution --------------------------------------------
+
+    use crate::compare::CompareMode;
+
+    #[test]
+    fn diff_defaults_to_exact_with_no_thresholds() {
+        let resolved = diff_args(&[]).resolve().unwrap();
+        assert_eq!(resolved.options.mode, CompareMode::Exact);
+        assert_eq!(resolved.options.pixel_threshold, 0);
+        assert_eq!(resolved.options.area_threshold, 0.0);
+        assert!(resolved.crop.is_none());
+        assert!(!resolved.json);
+    }
+
+    #[test]
+    fn diff_requires_two_inputs() {
+        assert!(Cli::try_parse_from(["eensh", "diff", "only-one.png"]).is_err());
+        assert!(Cli::try_parse_from(["eensh", "diff"]).is_err());
+    }
+
+    #[test]
+    fn diff_reads_each_threshold_option() {
+        let resolved = diff_args(&[
+            "--mode",
+            "rgb",
+            "--pixel-threshold",
+            "12",
+            "--area-threshold",
+            "0.005",
+        ])
+        .resolve()
+        .unwrap();
+        assert_eq!(resolved.options.mode, CompareMode::RgbThreshold);
+        assert_eq!(resolved.options.pixel_threshold, 12);
+        assert_eq!(resolved.options.area_threshold, 0.005);
+    }
+
+    #[test]
+    fn diff_rejects_an_unknown_mode() {
+        let error = diff_args(&["--mode", "perceptual"]).resolve().unwrap_err();
+        assert_eq!(error.code(), "invalid_arguments");
+        assert!(error.message().contains("perceptual"));
+    }
+
+    #[test]
+    fn diff_accepts_recognised_mode_spellings() {
+        for name in ["exact", "rgb", "rgb_threshold", "threshold", "RGB"] {
+            assert!(
+                diff_args(&["--mode", name]).resolve().is_ok(),
+                "mode {name:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_rejects_out_of_range_area_thresholds() {
+        for bad in ["1.5", "-0.1", "nan"] {
+            assert!(
+                Cli::try_parse_from(["eensh", "diff", "a.png", "b.png", "--area-threshold", bad,])
+                    .is_err(),
+                "area threshold {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_rejects_out_of_range_pixel_thresholds() {
+        assert!(Cli::try_parse_from([
+            "eensh",
+            "diff",
+            "a.png",
+            "b.png",
+            "--pixel-threshold",
+            "256"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "eensh",
+            "diff",
+            "a.png",
+            "b.png",
+            "--pixel-threshold",
+            "-1"
+        ])
+        .is_err());
+        // 255 is the top of the valid range and must be accepted.
+        assert_eq!(
+            diff_args(&["--pixel-threshold", "255"])
+                .resolve()
+                .unwrap()
+                .options
+                .pixel_threshold,
+            255
+        );
+    }
+
+    #[test]
+    fn diff_crop_format_follows_the_path_extension() {
+        let resolved = diff_args(&["--changed-crop", "changed.png"])
+            .resolve()
+            .unwrap();
+        assert_eq!(resolved.crop.unwrap().format, ImageFormat::Png);
+
+        let resolved = diff_args(&["--changed-crop", "changed.jpg"])
+            .resolve()
+            .unwrap();
+        assert_eq!(resolved.crop.unwrap().format, ImageFormat::Jpeg);
+
+        // With no extension, PNG is the documented default.
+        let resolved = diff_args(&["--changed-crop", "changed"]).resolve().unwrap();
+        assert_eq!(resolved.crop.unwrap().format, ImageFormat::Png);
+
+        // An explicit --crop-format wins over the extension.
+        let resolved = diff_args(&["--changed-crop", "changed.jpg", "--crop-format", "png"])
+            .resolve()
+            .unwrap();
+        assert_eq!(resolved.crop.unwrap().format, ImageFormat::Png);
+    }
+
+    #[test]
+    fn diff_rejects_an_unknown_crop_format() {
+        let error = diff_args(&["--changed-crop", "x.png", "--crop-format", "webp"])
+            .resolve()
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_arguments");
+    }
+
+    #[test]
+    fn diff_keeps_the_input_paths() {
+        let cli = Cli::try_parse_from(["eensh", "diff", "/tmp/a.png", "/tmp/b.jpg"]).unwrap();
+        match cli.command {
+            Command::Diff(args) => {
+                let resolved = args.resolve().unwrap();
+                assert_eq!(resolved.before, std::path::PathBuf::from("/tmp/a.png"));
+                assert_eq!(resolved.after, std::path::PathBuf::from("/tmp/b.jpg"));
+            }
+            other => panic!("expected diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_json_and_time_flags_resolve() {
+        let resolved = diff_args(&["--json", "--time"]).resolve().unwrap();
+        assert!(resolved.json);
+        assert!(resolved.print_timing);
     }
 }

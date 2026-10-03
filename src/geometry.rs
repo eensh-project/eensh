@@ -110,6 +110,11 @@ pub enum CaptureTarget {
     Region,
     /// A specific X11 window identified by its window ID.
     Window { id: String },
+    /// An image decoded from a file rather than captured from a display.
+    ///
+    /// Used by `eensh diff`, which compares saved observations without touching
+    /// X11. It carries no display because a decoded image has no screen geometry.
+    File { path: String },
 }
 
 /// Describes where the captured pixels came from on the source desktop.

@@ -1,6 +1,7 @@
-//! The stable JSON response shape.
+//! The stable JSON response shapes.
 //!
-//! The response deliberately keeps three groups of numbers apart, because
+//! There are two documents: the capture response and the diff response. The
+//! capture response deliberately keeps three groups of numbers apart, because
 //! conflating them is the classic way to make an agent-facing screenshot tool
 //! ambiguous:
 //!
@@ -10,9 +11,13 @@
 //!
 //! Nothing in the response asks the caller to guess which coordinate space a
 //! width belongs to.
+//!
+//! The diff response is additive: it documents a comparison without changing
+//! anything about the capture document.
 
 use serde::{Deserialize, Serialize};
 
+use crate::compare::Comparison;
 use crate::encode::EncodedImage;
 use crate::geometry::{SourceGeometry, Transform};
 use crate::timing::Timing;
@@ -92,6 +97,89 @@ impl CaptureResponse {
                 crate::error::Error::Internal(format!(
                     "capture response could not be serialized: {e}"
                 ))
+            })
+    }
+}
+
+/// Timings for a comparison, in microseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompareTiming {
+    /// Time spent reading and decoding the input images, or zero when the
+    /// comparison ran on in-memory frames.
+    pub load_us: u64,
+    /// Time spent comparing the two frames.
+    pub compare_us: u64,
+    /// Time spent writing the changed crop, if one was requested.
+    pub crop_us: u64,
+    /// Wall-clock duration of the whole operation.
+    pub total_us: u64,
+}
+
+/// A short description of one comparison input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputDescription {
+    /// Where the input came from.
+    pub source: SourceGeometry,
+    /// Width of the input in pixels.
+    pub width: u32,
+    /// Height of the input in pixels.
+    pub height: u32,
+}
+
+impl InputDescription {
+    /// Describe a frame.
+    pub fn from_frame(frame: &crate::frame::Frame) -> Self {
+        InputDescription {
+            source: frame.source_geometry.clone(),
+            width: frame.width(),
+            height: frame.height(),
+        }
+    }
+}
+
+/// Describes a crop of the second frame that was written to disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedCrop {
+    /// Where the crop was written.
+    pub path: String,
+    /// The region of the *after* frame that was cropped, in frame-local pixels.
+    pub region: crate::geometry::Rect,
+    /// Size of the written image in bytes.
+    pub byte_length: usize,
+    /// Image format of the written crop.
+    pub format: String,
+}
+
+/// A complete diff response.
+///
+/// The comparison is nested under `comparison` rather than flattened, so the
+/// fields that describe *what changed* stay visibly separate from the fields
+/// that describe the two inputs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiffResponse {
+    /// The first input.
+    pub before: InputDescription,
+    /// The second input.
+    pub after: InputDescription,
+    /// The comparison metrics.
+    pub comparison: Comparison,
+    /// The changed crop, if one was written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_crop: Option<ChangedCrop>,
+    /// Per-stage timings.
+    pub timing: CompareTiming,
+}
+
+impl DiffResponse {
+    /// Serialize to compact JSON followed by a newline.
+    pub fn to_json_string(&self) -> Result<String, crate::error::Error> {
+        serde_json::to_string(self)
+            .map(|mut text| {
+                text.push('\n');
+                text
+            })
+            .map_err(|e| {
+                crate::error::Error::Internal(format!("diff response could not be serialized: {e}"))
             })
     }
 }

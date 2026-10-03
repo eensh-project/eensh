@@ -142,6 +142,57 @@ impl Frame {
         self.pixels.height()
     }
 
+    /// Copy a sub-rectangle out of this frame into a new frame.
+    ///
+    /// `rect` is in frame-local coordinates and must lie entirely inside the
+    /// frame; the call fails rather than clipping, matching how capture treats
+    /// regions. The result is still a raw frame, so it can be encoded, compared,
+    /// or cropped again.
+    ///
+    /// The returned frame's source geometry is rewritten to describe the cropped
+    /// rectangle in the *original source* coordinate space, so a transform
+    /// computed from it remains correct.
+    pub fn crop(&self, rect: &Rect) -> Result<Frame, Error> {
+        let frame_rect = Rect {
+            x: 0,
+            y: 0,
+            width: self.width(),
+            height: self.height(),
+        };
+        rect.ensure_within(&frame_rect)?;
+
+        let bytes_per_pixel = self.pixel_format.bytes_per_pixel();
+        let source_stride = self.width() as usize * bytes_per_pixel;
+        let row_bytes = rect.width as usize * bytes_per_pixel;
+        let mut data = Vec::with_capacity(row_bytes * rect.height as usize);
+
+        for row in rect.y as usize..(rect.y as usize + rect.height as usize) {
+            let start = row * source_stride + rect.x as usize * bytes_per_pixel;
+            data.extend_from_slice(&self.pixels.data()[start..start + row_bytes]);
+        }
+
+        let pixels = PixelBuffer::new(rect.width, rect.height, self.pixel_format, data)?;
+
+        let mut source_geometry = self.source_geometry.clone();
+        // Shift the recorded source origin by the crop offset so that a transform
+        // derived from the cropped frame still maps into the original desktop.
+        source_geometry.x = source_geometry.x.checked_add(rect.x).ok_or_else(|| {
+            Error::InvalidRegion("crop origin overflows the source geometry".into())
+        })?;
+        source_geometry.y = source_geometry.y.checked_add(rect.y).ok_or_else(|| {
+            Error::InvalidRegion("crop origin overflows the source geometry".into())
+        })?;
+        source_geometry.width = rect.width;
+        source_geometry.height = rect.height;
+
+        Ok(Frame {
+            source_geometry,
+            pixel_format: self.pixel_format,
+            pixels,
+            captured_at: self.captured_at,
+        })
+    }
+
     /// Wall-clock timestamp of the capture, derived from the monotonic instant
     /// recorded at capture time.
     ///
@@ -185,5 +236,53 @@ mod tests {
         assert_eq!(frame.width(), 2);
         assert_eq!(frame.height(), 1);
         assert_eq!(frame.source_rect().pixel_count(), 2);
+    }
+
+    #[test]
+    fn crop_extracts_the_requested_rows_and_columns() {
+        // A 4x3 frame where each pixel encodes its own coordinates.
+        let mut data = Vec::new();
+        for y in 0..3u8 {
+            for x in 0..4u8 {
+                data.extend_from_slice(&[x, y, 0]);
+            }
+        }
+        let pixels = PixelBuffer::new(4, 3, PixelFormat::Rgb8, data).unwrap();
+        let frame = Frame::new(geometry(), pixels, std::time::Instant::now());
+
+        let cropped = frame.crop(&Rect::new(1, 1, 2, 2).unwrap()).unwrap();
+        assert_eq!((cropped.width(), cropped.height()), (2, 2));
+        assert_eq!(
+            cropped.pixels.data(),
+            &[1, 1, 0, 2, 1, 0, 1, 2, 0, 2, 2, 0],
+            "cropped pixels should be the (1,1)..(2,2) block"
+        );
+    }
+
+    #[test]
+    fn crop_shifts_the_source_origin_so_transforms_stay_correct() {
+        let mut geometry = geometry();
+        geometry.x = 100;
+        geometry.y = 200;
+        geometry.width = 4;
+        geometry.height = 3;
+        let pixels = PixelBuffer::new(4, 3, PixelFormat::Rgb8, vec![0; 36]).unwrap();
+        let frame = Frame::new(geometry, pixels, std::time::Instant::now());
+
+        let cropped = frame.crop(&Rect::new(1, 2, 2, 1).unwrap()).unwrap();
+        assert_eq!(cropped.source_geometry.x, 101);
+        assert_eq!(cropped.source_geometry.y, 202);
+        assert_eq!(cropped.source_geometry.width, 2);
+        assert_eq!(cropped.source_geometry.height, 1);
+    }
+
+    #[test]
+    fn crop_rejects_a_rectangle_outside_the_frame() {
+        let pixels = PixelBuffer::new(4, 4, PixelFormat::Rgb8, vec![0; 48]).unwrap();
+        let frame = Frame::new(geometry(), pixels, std::time::Instant::now());
+
+        assert!(frame.crop(&Rect::new(0, 0, 5, 4).unwrap()).is_err());
+        assert!(frame.crop(&Rect::new(3, 3, 2, 2).unwrap()).is_err());
+        assert!(frame.crop(&Rect::new(0, 0, 4, 4).unwrap()).is_ok());
     }
 }

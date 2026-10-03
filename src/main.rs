@@ -7,7 +7,7 @@ use clap::Parser;
 use eensh::cli::{Cli, Command};
 use eensh::error::Error;
 use eensh::output::{file, MetadataDestination};
-use eensh::pipeline;
+use eensh::{diff, pipeline};
 
 fn main() -> ExitCode {
     let code = run();
@@ -27,6 +27,7 @@ fn run() -> i32 {
 
     match cli.command {
         Command::Capture(args) => run_capture(&args),
+        Command::Diff(args) => run_diff(&args),
     }
 }
 
@@ -84,4 +85,44 @@ fn report(error: &Error, json: bool) -> i32 {
         file::write_stderr(&error.message());
     }
     error.exit_code()
+}
+
+/// Resolve and execute a diff, reporting failures in the requested format.
+///
+/// A visual difference is *not* an operational failure: the exit status reports
+/// whether the comparison ran, and whether the images differ is communicated
+/// through the output. That keeps `diff` unambiguous alongside the stable Phase 1
+/// exit codes, where a nonzero status always means an error.
+fn run_diff(args: &eensh::cli::DiffArgs) -> i32 {
+    let config = match args.resolve() {
+        Ok(config) => config,
+        Err(error) => return report(&error, args.json),
+    };
+
+    match diff::run(&config) {
+        Ok(outcome) => {
+            if config.json {
+                match outcome.response.to_json_string() {
+                    Ok(text) => {
+                        if let Err(error) = file::write_stdout_text(&text) {
+                            return report(&error, false);
+                        }
+                    }
+                    Err(error) => return report(&error, false),
+                }
+            } else {
+                file::write_stderr(&diff::summary(&outcome.response.comparison));
+            }
+
+            if config.print_timing {
+                let timing = &outcome.response.timing;
+                file::write_stderr(&format!(
+                    "eensh diff timing: load={}us compare={}us crop={}us total={}us",
+                    timing.load_us, timing.compare_us, timing.crop_us, timing.total_us,
+                ));
+            }
+            0
+        }
+        Err(error) => report(&error, args.json),
+    }
 }

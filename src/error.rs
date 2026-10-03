@@ -20,6 +20,9 @@
 //! | 7    | `resize_failed`      | the requested resize could not be performed    |
 //! | 8    | `encode_failed`      | PNG/JPEG encoding failed                       |
 //! | 9    | `output_failed`      | writing the result to disk or stdout failed    |
+//! | 10   | `incompatible_frames`| the two frames cannot be compared              |
+//! | 11   | `comparison_failed`  | the comparison could not be performed          |
+//! | 12   | `image_load_failed`  | an input image could not be read or decoded    |
 //!
 //! ## JSON shape
 //!
@@ -48,6 +51,12 @@ pub enum Error {
     EncodeFailed(String),
     /// The result could not be written to its destination.
     OutputFailed(String),
+    /// The two frames cannot be compared, for example because their sizes differ.
+    IncompatibleFrames(String),
+    /// The comparison could not be performed.
+    ComparisonFailed(String),
+    /// An input image could not be read or decoded.
+    ImageLoadFailed(String),
     /// An unexpected internal failure.
     Internal(String),
 }
@@ -86,6 +95,21 @@ impl Error {
         Error::OutputFailed(message.into())
     }
 
+    /// Convenience constructor for [`Error::IncompatibleFrames`].
+    pub fn incompatible_frames(message: impl Into<String>) -> Self {
+        Error::IncompatibleFrames(message.into())
+    }
+
+    /// Convenience constructor for [`Error::ComparisonFailed`].
+    pub fn comparison_failed(message: impl Into<String>) -> Self {
+        Error::ComparisonFailed(message.into())
+    }
+
+    /// Convenience constructor for [`Error::ImageLoadFailed`].
+    pub fn image_load_failed(message: impl Into<String>) -> Self {
+        Error::ImageLoadFailed(message.into())
+    }
+
     /// Convenience constructor for [`Error::Internal`].
     pub fn internal(message: impl Into<String>) -> Self {
         Error::Internal(message.into())
@@ -102,6 +126,9 @@ impl Error {
             Error::ResizeFailed(_) => "resize_failed",
             Error::EncodeFailed(_) => "encode_failed",
             Error::OutputFailed(_) => "output_failed",
+            Error::IncompatibleFrames(_) => "incompatible_frames",
+            Error::ComparisonFailed(_) => "comparison_failed",
+            Error::ImageLoadFailed(_) => "image_load_failed",
             Error::Internal(_) => "internal_error",
         }
     }
@@ -118,6 +145,9 @@ impl Error {
             Error::ResizeFailed(_) => 7,
             Error::EncodeFailed(_) => 8,
             Error::OutputFailed(_) => 9,
+            Error::IncompatibleFrames(_) => 10,
+            Error::ComparisonFailed(_) => 11,
+            Error::ImageLoadFailed(_) => 12,
         }
     }
 
@@ -136,6 +166,9 @@ impl Error {
             Error::ResizeFailed(m) => format!("resize failed: {m}"),
             Error::EncodeFailed(m) => format!("encode failed: {m}"),
             Error::OutputFailed(m) => format!("output failed: {m}"),
+            Error::IncompatibleFrames(m) => format!("incompatible frames: {m}"),
+            Error::ComparisonFailed(m) => format!("comparison failed: {m}"),
+            Error::ImageLoadFailed(m) => format!("image load failed: {m}"),
             Error::Internal(m) => format!("internal error: {m}"),
         }
     }
@@ -187,6 +220,13 @@ mod tests {
             (Error::ResizeFailed("x".into()), "resize_failed", 7),
             (Error::EncodeFailed("x".into()), "encode_failed", 8),
             (Error::OutputFailed("x".into()), "output_failed", 9),
+            (
+                Error::IncompatibleFrames("x".into()),
+                "incompatible_frames",
+                10,
+            ),
+            (Error::ComparisonFailed("x".into()), "comparison_failed", 11),
+            (Error::ImageLoadFailed("x".into()), "image_load_failed", 12),
             (Error::Internal("x".into()), "internal_error", 1),
         ];
 

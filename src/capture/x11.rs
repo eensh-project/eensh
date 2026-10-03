@@ -149,6 +149,12 @@ pub fn capture_window(display: &Display, window: u64) -> Result<Frame, Error> {
 }
 
 /// Read `rect` from `window` and build a [`Frame`].
+///
+/// Each frame owns its pixel allocation. That is inherent rather than an
+/// oversight: a persistent session retains raw frames in its history, and a
+/// retained frame cannot share a scratch buffer with the next capture. The
+/// per-sample saving that Phase 4 delivers comes from reusing the X11
+/// *connection*, not from reusing this buffer.
 fn capture_root_rect(
     display: &Display,
     window: u64,

@@ -12,9 +12,11 @@ pub mod png;
 
 use crate::error::Error;
 use crate::frame::Frame;
+use serde::{Deserialize, Serialize};
 
 /// Supported output image formats.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ImageFormat {
     Png,
     Jpeg,
@@ -62,7 +64,8 @@ impl std::fmt::Display for ImageFormat {
 }
 
 /// How much effort to spend compressing PNG output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PngEffort {
     Fast,
     Default,

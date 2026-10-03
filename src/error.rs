@@ -27,6 +27,14 @@
 //! | 14   | `target_lost`        | the observed target disappeared mid-observation |
 //! | 15   | `invalid_duration`   | a duration argument was zero, negative, or unparsable |
 //! | 16   | `observation_failed` | the observation could not be performed         |
+//! | 17   | `session_not_found`  | the requested capture session does not exist   |
+//! | 18   | `session_busy`       | the session is already running another operation |
+//! | 19   | `session_closed`     | the session was closed while the request ran    |
+//! | 20   | `frame_not_available`| the requested frame is not in the session's history |
+//! | 21   | `service_unavailable`| the local service could not be reached         |
+//! | 22   | `service_protocol_error` | the service sent an unusable response       |
+//! | 23   | `service_overloaded` | the service refused the request as busy        |
+//! | 24   | `no_frame_available` | the session has not captured a frame yet       |
 //!
 //! ## JSON shape
 //!
@@ -69,6 +77,22 @@ pub enum Error {
     InvalidDuration(String),
     /// The observation could not be performed.
     ObservationFailed(String),
+    /// The requested capture session does not exist.
+    SessionNotFound(String),
+    /// The session is already running another operation.
+    SessionBusy(String),
+    /// The session was closed while the request was running.
+    SessionClosed(String),
+    /// The requested frame is not in the session's history.
+    FrameNotAvailable(String),
+    /// The session has not captured a frame yet.
+    NoFrameAvailable(String),
+    /// The local service could not be reached.
+    ServiceUnavailable(String),
+    /// The service sent an unusable or malformed response.
+    ServiceProtocolError(String),
+    /// The service refused the request because it is overloaded.
+    ServiceOverloaded(String),
     /// An unexpected internal failure.
     Internal(String),
 }
@@ -142,6 +166,60 @@ impl Error {
         Error::ObservationFailed(message.into())
     }
 
+    /// Convenience constructor for [`Error::SessionNotFound`].
+    pub fn session_not_found(message: impl Into<String>) -> Self {
+        Error::SessionNotFound(message.into())
+    }
+
+    /// Convenience constructor for [`Error::SessionBusy`].
+    pub fn session_busy(message: impl Into<String>) -> Self {
+        Error::SessionBusy(message.into())
+    }
+
+    /// Convenience constructor for [`Error::SessionClosed`].
+    pub fn session_closed(message: impl Into<String>) -> Self {
+        Error::SessionClosed(message.into())
+    }
+
+    /// Convenience constructor for [`Error::FrameNotAvailable`].
+    pub fn frame_not_available(message: impl Into<String>) -> Self {
+        Error::FrameNotAvailable(message.into())
+    }
+
+    /// Convenience constructor for [`Error::NoFrameAvailable`].
+    pub fn no_frame_available(message: impl Into<String>) -> Self {
+        Error::NoFrameAvailable(message.into())
+    }
+
+    /// Convenience constructor for [`Error::ServiceUnavailable`].
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Error::ServiceUnavailable(message.into())
+    }
+
+    /// Convenience constructor for [`Error::ServiceProtocolError`].
+    pub fn service_protocol_error(message: impl Into<String>) -> Self {
+        Error::ServiceProtocolError(message.into())
+    }
+
+    /// Convenience constructor for [`Error::ServiceOverloaded`].
+    pub fn service_overloaded(message: impl Into<String>) -> Self {
+        Error::ServiceOverloaded(message.into())
+    }
+
+    /// Whether this error means the request should not be retried against the
+    /// same session.
+    ///
+    /// Used by the service to decide whether a session is still usable.
+    pub fn is_session_fatal(&self) -> bool {
+        matches!(
+            self,
+            Error::SessionNotFound(_)
+                | Error::SessionClosed(_)
+                | Error::TargetLost(_)
+                | Error::DisplayUnavailable { .. }
+        )
+    }
+
     /// Convenience constructor for [`Error::Internal`].
     pub fn internal(message: impl Into<String>) -> Self {
         Error::Internal(message.into())
@@ -165,6 +243,14 @@ impl Error {
             Error::TargetLost(_) => "target_lost",
             Error::InvalidDuration(_) => "invalid_duration",
             Error::ObservationFailed(_) => "observation_failed",
+            Error::SessionNotFound(_) => "session_not_found",
+            Error::SessionBusy(_) => "session_busy",
+            Error::SessionClosed(_) => "session_closed",
+            Error::FrameNotAvailable(_) => "frame_not_available",
+            Error::NoFrameAvailable(_) => "no_frame_available",
+            Error::ServiceUnavailable(_) => "service_unavailable",
+            Error::ServiceProtocolError(_) => "service_protocol_error",
+            Error::ServiceOverloaded(_) => "service_overloaded",
             Error::Internal(_) => "internal_error",
         }
     }
@@ -188,6 +274,14 @@ impl Error {
             Error::TargetLost(_) => 14,
             Error::InvalidDuration(_) => 15,
             Error::ObservationFailed(_) => 16,
+            Error::SessionNotFound(_) => 17,
+            Error::SessionBusy(_) => 18,
+            Error::SessionClosed(_) => 19,
+            Error::FrameNotAvailable(_) => 20,
+            Error::NoFrameAvailable(_) => 21,
+            Error::ServiceUnavailable(_) => 22,
+            Error::ServiceProtocolError(_) => 23,
+            Error::ServiceOverloaded(_) => 24,
         }
     }
 
@@ -213,6 +307,14 @@ impl Error {
             Error::TargetLost(m) => format!("target lost: {m}"),
             Error::InvalidDuration(m) => format!("invalid duration: {m}"),
             Error::ObservationFailed(m) => format!("observation failed: {m}"),
+            Error::SessionNotFound(m) => format!("session not found: {m}"),
+            Error::SessionBusy(m) => format!("session busy: {m}"),
+            Error::SessionClosed(m) => format!("session closed: {m}"),
+            Error::FrameNotAvailable(m) => format!("frame not available: {m}"),
+            Error::NoFrameAvailable(m) => format!("no frame available: {m}"),
+            Error::ServiceUnavailable(m) => format!("service unavailable: {m}"),
+            Error::ServiceProtocolError(m) => format!("service protocol error: {m}"),
+            Error::ServiceOverloaded(m) => format!("service overloaded: {m}"),
             Error::Internal(m) => format!("internal error: {m}"),
         }
     }
@@ -278,6 +380,34 @@ mod tests {
                 Error::ObservationFailed("x".into()),
                 "observation_failed",
                 16,
+            ),
+            (Error::SessionNotFound("x".into()), "session_not_found", 17),
+            (Error::SessionBusy("x".into()), "session_busy", 18),
+            (Error::SessionClosed("x".into()), "session_closed", 19),
+            (
+                Error::FrameNotAvailable("x".into()),
+                "frame_not_available",
+                20,
+            ),
+            (
+                Error::NoFrameAvailable("x".into()),
+                "no_frame_available",
+                21,
+            ),
+            (
+                Error::ServiceUnavailable("x".into()),
+                "service_unavailable",
+                22,
+            ),
+            (
+                Error::ServiceProtocolError("x".into()),
+                "service_protocol_error",
+                23,
+            ),
+            (
+                Error::ServiceOverloaded("x".into()),
+                "service_overloaded",
+                24,
             ),
             (Error::Internal("x".into()), "internal_error", 1),
         ];

@@ -331,6 +331,12 @@ impl ObservedFrame {
 /// the temporal outcome, plus the comparisons that explain it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObservationResponse {
+    /// The session this observation ran in, for `eensh session observe`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The frame identifiers that mark the semantic points of the observation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames: Option<ObservationFrameIds>,
     /// What happened, temporally.
     pub observation: ObservationSection,
     /// Native source geometry of the observed target.
@@ -349,6 +355,24 @@ pub struct ObservationResponse {
     pub first_change: Option<TransitionComparison>,
     /// Where the time went.
     pub timing: ObservationTimingSection,
+}
+
+/// The frame identifiers marking an observation's semantic points.
+///
+/// A caller should never have to infer which frames mattered from a count. These
+/// are the true identifiers, and an older one may already have been evicted from
+/// public history by the time the observation returns; retrieval of an evicted
+/// frame reports `frame_not_available` rather than quietly substituting another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationFrameIds {
+    /// The fixed baseline frame, for the operations that keep one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<crate::session::FrameId>,
+    /// The frame that first showed a meaningful change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_change: Option<crate::session::FrameId>,
+    /// The frame the operation returned.
+    pub final_frame: crate::session::FrameId,
 }
 
 impl ObservationResponse {

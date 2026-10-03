@@ -31,11 +31,13 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # X11 development headers at build time, which matters for portability.
 x11-dl = "2"
 
-[dev-dependencies]
-# Used by the integration tests to render known content into an Xvfb display,
-# and to terminate Xvfb gracefully so it cleans up its own lock file.
-x11-dl = "2"
+# Used for `getuid` when falling back to a user-namespaced socket path, and by
+# the tests to signal Xvfb so it can clean up after itself.
 libc = "0.2"
+
+[dev-dependencies]
+# Used by the integration tests to render known content into an Xvfb display.
+x11-dl = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [profile.release]

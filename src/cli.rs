@@ -54,6 +54,529 @@ pub enum Command {
     WaitStable(Box<ObservationArgs>),
     /// Wait for a visual transition, then wait for it to settle.
     Observe(Box<ObservationArgs>),
+    /// Run the persistent capture service in the foreground.
+    ///
+    /// The service is never started automatically. An agent that wants a
+    /// persistent session starts one deliberately, and stops it deliberately.
+    Serve(ServeArgs),
+    /// Ask a running service whether it is alive.
+    Ping(ServeArgs),
+    /// Talk to a running service: create a session, capture, compare, observe.
+    Session(Box<SessionArgs>),
+}
+
+/// Options for `eensh serve` and `eensh ping`.
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// Unix socket to listen on or connect to. Defaults to `$EENSH_SOCKET`,
+    /// then `$XDG_RUNTIME_DIR/eensh.sock`, then a user-scoped temporary path.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+
+    /// Emit the service status as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `eensh session`.
+#[derive(Debug, Args)]
+pub struct SessionArgs {
+    /// Unix socket of the service to talk to.
+    #[arg(long, value_name = "PATH", global = true)]
+    pub socket: Option<PathBuf>,
+
+    /// Emit a stable JSON response instead of a one-line summary.
+    ///
+    /// Session responses are agent-facing, so this is the documented way to
+    /// consume them; it is also what a frame or observation result is rendered
+    /// through. Passing `--json` is required for the JSON contract and defaults
+    /// to the compact human summary otherwise.
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    #[command(subcommand)]
+    pub command: SessionCommand,
+}
+
+/// The `eensh session` subcommands.
+///
+/// Every one of these is a thin client of the service protocol. None of them
+/// opens a display itself: a display is opened once, by the session the service
+/// holds.
+#[derive(Debug, Subcommand)]
+pub enum SessionCommand {
+    /// Start a session bound to a display and target.
+    Create(SessionCreateArgs),
+    /// List the sessions the service is holding.
+    List {
+        /// Emit a stable JSON response.
+        #[arg(long)]
+        json: bool,
+        /// Unix socket of the service to talk to.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Describe one session.
+    Info {
+        /// The session to describe.
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        /// Emit a stable JSON response.
+        #[arg(long)]
+        json: bool,
+        /// Unix socket of the service to talk to.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Close a session and release its display.
+    Close {
+        /// The session to close.
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        /// Emit a stable JSON response.
+        #[arg(long)]
+        json: bool,
+        /// Unix socket of the service to talk to.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Capture a new frame and return it.
+    Capture {
+        /// The session to capture from.
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        #[command(flatten)]
+        image: SessionImageArgs,
+        /// Embed the frame in the response as base64.
+        #[arg(long)]
+        base64: bool,
+        /// Emit a stable JSON response.
+        #[arg(long)]
+        json: bool,
+        /// Unix socket of the service to talk to.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Return the newest frame the session already holds, without capturing.
+    Latest {
+        /// The session to read from.
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        #[command(flatten)]
+        image: SessionImageArgs,
+        /// Embed the frame in the response as base64.
+        #[arg(long)]
+        base64: bool,
+        /// Emit a stable JSON response.
+        #[arg(long)]
+        json: bool,
+        /// Unix socket of the service to talk to.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Return a specific frame the session still retains, without capturing.
+    Frame {
+        /// The session to read from.
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        /// The frame ID to retrieve.
+        #[arg(value_name = "FRAME_ID", value_parser = parse_frame_id)]
+        frame_id: u64,
+        #[command(flatten)]
+        image: SessionImageArgs,
+        /// Embed the frame in the response as base64.
+        #[arg(long)]
+        base64: bool,
+        /// Emit a stable JSON response.
+        #[arg(long)]
+        json: bool,
+        /// Unix socket of the service to talk to.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Compare two retained frames of a session.
+    Diff {
+        /// The session holding both frames.
+        #[arg(value_name = "SESSION_ID")]
+        session_id: String,
+        /// The earlier frame ID.
+        #[arg(value_name = "BEFORE", value_parser = parse_frame_id)]
+        before: u64,
+        /// The later frame ID.
+        #[arg(value_name = "AFTER", value_parser = parse_frame_id)]
+        after: u64,
+        /// Comparison mode: `exact` or `rgb`.
+        #[arg(long, value_name = "MODE")]
+        mode: Option<String>,
+        /// Largest per-channel difference still considered unchanged, 0-255.
+        #[arg(long, value_name = "0-255", value_parser = clap::value_parser!(u8))]
+        pixel_threshold: Option<u8>,
+        /// Smallest changed fraction still considered meaningful change, 0.0-1.0.
+        #[arg(long, value_name = "0.0-1.0", value_parser = parse_area_threshold)]
+        area_threshold: Option<f64>,
+        /// Emit a stable JSON response.
+        #[arg(long)]
+        json: bool,
+        /// Unix socket of the service to talk to.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Observe a session until it meaningfully changes.
+    #[command(name = "wait-change")]
+    WaitChange(SessionObserveArgs),
+    /// Observe a session until it holds still.
+    #[command(name = "wait-stable")]
+    WaitStable(SessionObserveArgs),
+    /// Observe a session through a transition and then through its settling.
+    Observe(SessionObserveArgs),
+}
+
+/// Arguments for `eensh session create`.
+#[derive(Debug, Args)]
+pub struct SessionCreateArgs {
+    /// X11 display for the session, for example `:99`. Defaults to `$DISPLAY`.
+    #[arg(long, value_name = "DISPLAY")]
+    pub display: Option<String>,
+
+    /// Rectangle to observe, as `X,Y,WIDTH,HEIGHT` in source-desktop pixels.
+    #[arg(
+        long,
+        value_name = "X,Y,W,H",
+        value_parser = parse_region,
+        allow_hyphen_values = true,
+        conflicts_with = "window"
+    )]
+    pub region: Option<Rect>,
+
+    /// X11 window ID to observe, decimal or `0x`-prefixed hexadecimal.
+    #[arg(
+        long,
+        value_name = "WINDOW_ID",
+        value_parser = parse_window_id,
+        conflicts_with = "region"
+    )]
+    pub window: Option<u64>,
+
+    /// How many recent frames the session retains, 1-256. Defaults to 8.
+    #[arg(long, value_name = "COUNT", value_parser = parse_history_capacity)]
+    pub history: Option<usize>,
+
+    /// Emit a stable JSON response.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Unix socket of the service to talk to.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl SessionCreateArgs {
+    /// The target the session should observe.
+    pub fn target(&self) -> SessionTarget {
+        if let Some(window) = self.window {
+            SessionTarget::Window(window)
+        } else if let Some(region) = self.region {
+            SessionTarget::Region(region)
+        } else {
+            SessionTarget::Desktop
+        }
+    }
+}
+
+/// Which part of a display a session is bound to.
+///
+/// Mirrors [`CaptureRequest`] but stays separate, because a session target is
+/// resolved once at creation and then reused for every capture, whereas a capture
+/// request is resolved per invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTarget {
+    /// The whole desktop.
+    Desktop,
+    /// A fixed rectangle of the desktop.
+    Region(Rect),
+    /// A single X11 window.
+    Window(u64),
+}
+
+impl SessionTarget {
+    /// The kind name used in JSON.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SessionTarget::Desktop => "desktop",
+            SessionTarget::Region(_) => "region",
+            SessionTarget::Window(_) => "window",
+        }
+    }
+}
+
+/// Arguments shared by the three session observation subcommands.
+#[derive(Debug, Args)]
+pub struct SessionObserveArgs {
+    /// The session to observe.
+    #[arg(value_name = "SESSION_ID")]
+    pub session_id: String,
+
+    /// Comparison mode for change detection: `exact` or `rgb`.
+    #[arg(long, value_name = "MODE")]
+    pub mode: Option<String>,
+
+    /// Largest per-channel difference treated as unchanged, 0-255.
+    #[arg(long, value_name = "0-255", value_parser = clap::value_parser!(u8))]
+    pub pixel_threshold: Option<u8>,
+
+    /// Smallest changed fraction treated as meaningful change, 0.0-1.0.
+    #[arg(long, value_name = "0.0-1.0", value_parser = parse_area_threshold)]
+    pub area_threshold: Option<f64>,
+
+    /// Target cadence between samples, for example `100ms`.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub interval: Option<Duration>,
+
+    /// Total deadline for the whole operation, for example `5s`.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub timeout: Option<Duration>,
+
+    /// How long the scene must hold still, for `wait-stable` and `observe`.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub stable_for: Option<Duration>,
+
+    #[command(flatten)]
+    pub image: SessionImageArgs,
+
+    /// Embed the returned frame in the response as base64.
+    #[arg(long)]
+    pub base64: bool,
+
+    /// Emit a stable JSON response.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Unix socket of the service to talk to.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl SessionObserveArgs {
+    /// The comparison, cadence, and deadline, with the documented defaults.
+    ///
+    /// Same profile as the standalone observation commands, so an observation
+    /// gives the same answer whether or not a session is used.
+    pub fn temporal(&self) -> Result<TemporalCompareOptions, Error> {
+        let default = TemporalCompareOptions::default();
+
+        let mode = match self.mode.as_deref() {
+            Some(name) => CompareMode::from_name(name)?,
+            None => default.compare.mode,
+        };
+
+        let temporal = TemporalCompareOptions {
+            compare: CompareOptions {
+                mode,
+                pixel_threshold: self
+                    .pixel_threshold
+                    .unwrap_or(default.compare.pixel_threshold),
+                area_threshold: self
+                    .area_threshold
+                    .unwrap_or(default.compare.area_threshold),
+            },
+            interval: self.interval.unwrap_or(default.interval),
+            timeout: self.timeout.unwrap_or(default.timeout),
+        };
+
+        temporal.validate()?;
+        Ok(temporal)
+    }
+
+    /// The required stability duration, with the operation's own default.
+    pub fn stable_for(&self, kind: ObservationKind) -> Duration {
+        if let Some(stable_for) = self.stable_for {
+            return stable_for;
+        }
+        match kind {
+            ObservationKind::WaitStable => WaitStableOptions::default().stable_for,
+            ObservationKind::Observe => ObserveOptions::with_defaults().stable_for,
+            // `wait-change` has no stability requirement; the value is unused.
+            ObservationKind::WaitChange => Duration::ZERO,
+        }
+    }
+}
+
+/// Image presentation options for a session frame.
+///
+/// The same surface as a capture, so a session frame is configured exactly like
+/// a standalone one. The output *path* is absent by design: a session frame is
+/// delivered in the response, either inline as base64 or not at all.
+#[derive(Debug, Clone, Args)]
+pub struct SessionImageArgs {
+    /// Output image format: `png` or `jpeg`.
+    #[arg(long, value_name = "FORMAT")]
+    pub format: Option<String>,
+
+    /// JPEG quality, 1-100. Only valid with `--format jpeg`.
+    #[arg(long, value_name = "QUALITY", value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub quality: Option<u8>,
+
+    /// Resize the returned frame to this width, preserving the aspect ratio.
+    #[arg(
+        long,
+        value_name = "WIDTH",
+        value_parser = clap::value_parser!(u32).range(1..),
+        conflicts_with_all = ["height", "scale"]
+    )]
+    pub width: Option<u32>,
+
+    /// Resize the returned frame to this height, preserving the aspect ratio.
+    #[arg(
+        long,
+        value_name = "HEIGHT",
+        value_parser = clap::value_parser!(u32).range(1..),
+        conflicts_with_all = ["width", "scale"]
+    )]
+    pub height: Option<u32>,
+
+    /// Resize the returned frame by this factor, preserving the aspect ratio.
+    #[arg(
+        long,
+        value_name = "FACTOR",
+        value_parser = parse_scale,
+        conflicts_with_all = ["width", "height"]
+    )]
+    pub scale: Option<f64>,
+
+    /// PNG compression effort: `fast`, `default`, or `best`.
+    #[arg(long, value_name = "EFFORT")]
+    pub compression: Option<String>,
+}
+
+impl SessionImageArgs {
+    /// Resolve into the pipeline's image options.
+    pub fn to_image_options(&self) -> Result<ImageOptions, Error> {
+        let format = match self.format.as_deref() {
+            Some(name) => ImageFormat::from_name(name)?,
+            None => ImageFormat::Png,
+        };
+
+        let quality =
+            match (self.quality, format) {
+                (Some(_), ImageFormat::Png) => return Err(Error::invalid_arguments(
+                    "--quality applies only to JPEG output; add --format jpeg or drop --quality",
+                )),
+                (Some(quality), _) => quality,
+                (None, _) => jpeg::DEFAULT_QUALITY,
+            };
+
+        let png_effort = match (self.compression.as_deref(), format) {
+            (Some(_), ImageFormat::Jpeg) => {
+                return Err(Error::invalid_arguments(
+                    "--compression applies only to PNG output; add --format png or drop \
+                     --compression",
+                ))
+            }
+            (Some(name), _) => PngEffort::from_name(name)?,
+            (None, _) => PngEffort::Default,
+        };
+
+        Ok(ImageOptions {
+            resize: self.resolve_resize()?,
+            format,
+            quality,
+            png_effort,
+            // Whether the frame is embedded is a property of the request, not of
+            // the image, and is set by the caller.
+            base64: false,
+        })
+    }
+
+    /// Decide the resize request, rejecting unsupported combinations.
+    fn resolve_resize(&self) -> Result<ResizeRequest, Error> {
+        if let Some(width) = self.width {
+            return Ok(ResizeRequest::Width(width));
+        }
+        if let Some(height) = self.height {
+            return Ok(ResizeRequest::Height(height));
+        }
+        if let Some(scale) = self.scale {
+            return Ok(ResizeRequest::Scale(scale));
+        }
+        Ok(ResizeRequest::None)
+    }
+}
+
+impl SessionCommand {
+    /// Whether JSON output was requested.
+    pub fn json(&self) -> bool {
+        match self {
+            SessionCommand::Create(args) => args.json,
+            SessionCommand::List { json, .. }
+            | SessionCommand::Info { json, .. }
+            | SessionCommand::Close { json, .. }
+            | SessionCommand::Capture { json, .. }
+            | SessionCommand::Latest { json, .. }
+            | SessionCommand::Frame { json, .. }
+            | SessionCommand::Diff { json, .. } => *json,
+            SessionCommand::WaitChange(args)
+            | SessionCommand::WaitStable(args)
+            | SessionCommand::Observe(args) => args.json,
+        }
+    }
+
+    /// The explicit socket path, if one was given.
+    pub fn socket(&self) -> Option<&PathBuf> {
+        match self {
+            SessionCommand::Create(args) => args.socket.as_ref(),
+            SessionCommand::List { socket, .. }
+            | SessionCommand::Info { socket, .. }
+            | SessionCommand::Close { socket, .. }
+            | SessionCommand::Capture { socket, .. }
+            | SessionCommand::Latest { socket, .. }
+            | SessionCommand::Frame { socket, .. }
+            | SessionCommand::Diff { socket, .. } => socket.as_ref(),
+            SessionCommand::WaitChange(args)
+            | SessionCommand::WaitStable(args)
+            | SessionCommand::Observe(args) => args.socket.as_ref(),
+        }
+    }
+
+    /// Which temporal operation this command runs, if it is an observation.
+    pub fn observation_kind(&self) -> Option<ObservationKind> {
+        match self {
+            SessionCommand::WaitChange(_) => Some(ObservationKind::WaitChange),
+            SessionCommand::WaitStable(_) => Some(ObservationKind::WaitStable),
+            SessionCommand::Observe(_) => Some(ObservationKind::Observe),
+            _ => None,
+        }
+    }
+
+    /// The comparison options of a session diff, if this is one.
+    ///
+    /// Resolved here rather than in the client so that a session diff applies
+    /// exactly the same defaults and the same validation as `eensh diff` does.
+    pub fn diff_compare_options(&self) -> Result<Option<CompareOptions>, Error> {
+        match self {
+            SessionCommand::Diff {
+                mode,
+                pixel_threshold,
+                area_threshold,
+                ..
+            } => {
+                let mode = match mode.as_deref() {
+                    Some(name) => CompareMode::from_name(name)?,
+                    // The same opt-in default as `eensh diff`: with no flags the
+                    // question answered is "did anything at all differ".
+                    None => CompareMode::Exact,
+                };
+
+                let options = CompareOptions {
+                    mode,
+                    pixel_threshold: pixel_threshold.unwrap_or(0),
+                    area_threshold: area_threshold.unwrap_or(0.0),
+                };
+                options.validate()?;
+                Ok(Some(options))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 /// Which temporal operation is being run.
@@ -605,6 +1128,42 @@ fn parse_window_id(text: &str) -> Result<u64, String> {
              hexadecimal number"
         )),
     }
+}
+
+/// Parse a frame identifier.
+fn parse_frame_id(text: &str) -> Result<u64, String> {
+    let value = text
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("{text:?} is not a frame ID"))?;
+    if value == 0 {
+        // Frame IDs start at 1, so zero is never a valid identifier and would
+        // otherwise be reported as `frame_not_available` rather than as a bad
+        // argument.
+        return Err("frame IDs start at 1; 0 is not a valid frame ID".to_string());
+    }
+    Ok(value)
+}
+
+/// Parse a session history capacity.
+///
+/// Bounded by the history module's own limit rather than by a number invented
+/// here, so the two cannot drift apart.
+fn parse_history_capacity(text: &str) -> Result<usize, String> {
+    let value = text
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("{text:?} is not a history capacity"))?;
+    if value == 0 {
+        return Err("history capacity must be at least 1".to_string());
+    }
+    if value > crate::session::history::MAX_CAPACITY {
+        return Err(format!(
+            "history capacity must be at most {}, got {value}",
+            crate::session::history::MAX_CAPACITY
+        ));
+    }
+    Ok(value)
 }
 
 /// Parse a positive, finite scale factor.

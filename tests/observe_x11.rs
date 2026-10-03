@@ -21,8 +21,6 @@
 mod common;
 
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
@@ -36,99 +34,6 @@ fn skip_if_no_xvfb() -> bool {
         return false;
     }
     true
-}
-
-/// Paint on a schedule from a background thread, holding its own X connection.
-///
-/// A scripted painter is what makes these tests deterministic rather than racy:
-/// the paints happen at known offsets from the start of the observation, and the
-/// observer is expected to end up in the corresponding state.
-struct Painter {
-    stop: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Painter {
-    /// Start painting according to `script`, as `(delay_from_start, paints)`.
-    fn start(display: String, script: Vec<(Duration, Vec<PaintOp>)>) -> Painter {
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_flag = Arc::clone(&stop);
-
-        let handle = std::thread::spawn(move || {
-            let screen = Screen::open(&display);
-            let masks = screen.visual_masks();
-
-            let started = std::time::Instant::now();
-            for (delay, ops) in script {
-                // Sleep in small slices so the stop flag is honoured promptly.
-                while started.elapsed() < delay {
-                    if stop_flag.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let remaining = delay.saturating_sub(started.elapsed());
-                    std::thread::sleep(remaining.min(Duration::from_millis(5)));
-                }
-                if stop_flag.load(Ordering::Relaxed) {
-                    return;
-                }
-                for op in &ops {
-                    screen.fill(
-                        screen.root(),
-                        op.x,
-                        op.y,
-                        op.width,
-                        op.height,
-                        rgb_to_pixel(masks, op.rgb),
-                    );
-                }
-            }
-
-            // Hold the connection open until told to stop, so Xvfb does not reset
-            // the root window while the observer is still capturing.
-            while !stop_flag.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        });
-
-        Painter {
-            stop,
-            handle: Some(handle),
-        }
-    }
-}
-
-impl Drop for Painter {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-/// One rectangle to paint.
-#[derive(Debug, Clone, Copy)]
-struct PaintOp {
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-    rgb: [u8; 3],
-}
-
-/// A rectangle covering a fraction of the screen.
-///
-/// With area thresholds expressed as fractions, it is convenient to paint a
-/// region whose area is an exact percentage of the 400x300 screen. A 100x60
-/// rectangle is 6% of it, which clears the default 0.5% threshold comfortably.
-fn rect(x: i32, y: i32, rgb: [u8; 3]) -> PaintOp {
-    PaintOp {
-        x,
-        y,
-        width: 100,
-        height: 60,
-        rgb,
-    }
 }
 
 /// Run an observation command and parse its JSON **stdout** response.
@@ -203,7 +108,10 @@ fn wait_change_returns_when_the_scene_changes() {
     // Paint a red rectangle 150ms in, well after the baseline is taken.
     let painter = Painter::start(
         display.clone(),
-        vec![(Duration::from_millis(150), vec![rect(100, 80, [255, 0, 0])])],
+        vec![(
+            Duration::from_millis(150),
+            vec![paint_rect(100, 80, [255, 0, 0])],
+        )],
     );
 
     let (code, response, stderr) = run_observation(&[
@@ -315,7 +223,7 @@ fn wait_change_ignores_a_change_below_the_pixel_threshold() {
         display.clone(),
         vec![(
             Duration::from_millis(100),
-            vec![rect(50, 50, [105, 105, 105])],
+            vec![paint_rect(50, 50, [105, 105, 105])],
         )],
     );
 
@@ -427,12 +335,21 @@ fn wait_stable_does_not_return_while_painting_continues_then_returns_after_it_st
     let painter = Painter::start(
         display.clone(),
         vec![
-            (Duration::from_millis(100), vec![rect(0, 0, [255, 0, 0])]),
-            (Duration::from_millis(200), vec![rect(100, 0, [0, 255, 0])]),
-            (Duration::from_millis(300), vec![rect(200, 0, [0, 0, 255])]),
+            (
+                Duration::from_millis(100),
+                vec![paint_rect(0, 0, [255, 0, 0])],
+            ),
+            (
+                Duration::from_millis(200),
+                vec![paint_rect(100, 0, [0, 255, 0])],
+            ),
+            (
+                Duration::from_millis(300),
+                vec![paint_rect(200, 0, [0, 0, 255])],
+            ),
             (
                 Duration::from_millis(400),
-                vec![rect(300, 0, [255, 255, 0])],
+                vec![paint_rect(300, 0, [255, 255, 0])],
             ),
         ],
     );
@@ -610,9 +527,18 @@ fn observe_detects_a_transition_and_returns_the_settled_frame() {
     let painter = Painter::start(
         display.clone(),
         vec![
-            (Duration::from_millis(120), vec![rect(0, 0, [0, 255, 0])]),
-            (Duration::from_millis(200), vec![rect(100, 0, [0, 0, 255])]),
-            (Duration::from_millis(280), vec![rect(300, 240, final_rgb)]),
+            (
+                Duration::from_millis(120),
+                vec![paint_rect(0, 0, [0, 255, 0])],
+            ),
+            (
+                Duration::from_millis(200),
+                vec![paint_rect(100, 0, [0, 0, 255])],
+            ),
+            (
+                Duration::from_millis(280),
+                vec![paint_rect(300, 240, final_rgb)],
+            ),
         ],
     );
 
@@ -788,9 +714,12 @@ fn observe_completes_when_the_scene_returns_to_its_baseline() {
         vec![
             (
                 Duration::from_millis(120),
-                vec![rect(50, 50, [255, 255, 255])],
+                vec![paint_rect(50, 50, [255, 255, 255])],
             ),
-            (Duration::from_millis(250), vec![rect(50, 50, baseline)]),
+            (
+                Duration::from_millis(250),
+                vec![paint_rect(50, 50, baseline)],
+            ),
         ],
     );
 
@@ -844,7 +773,10 @@ fn observation_comparison_runs_at_native_resolution_not_the_output_size() {
 
     let painter = Painter::start(
         display.clone(),
-        vec![(Duration::from_millis(120), vec![rect(100, 80, [255, 0, 0])])],
+        vec![(
+            Duration::from_millis(120),
+            vec![paint_rect(100, 80, [255, 0, 0])],
+        )],
     );
 
     // Ask for a downscaled JPEG output. The comparison must still report the

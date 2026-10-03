@@ -93,6 +93,8 @@ pub mod observe;
 pub mod output;
 pub mod pipeline;
 pub mod resize;
+pub mod service;
+pub mod session;
 pub mod timing;
 
 pub use error::Error;

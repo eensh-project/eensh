@@ -229,6 +229,8 @@ fn finish<C: ObservationConfig>(
     let prepared = pipeline::prepare_image(frame, &options)?;
 
     let response = ObservationResponse {
+        session_id: None,
+        frames: None,
         observation: section,
         source: prepared.source_geometry.clone(),
         transform: prepared.transform,

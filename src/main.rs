@@ -33,6 +33,9 @@ fn run() -> i32 {
         Command::WaitChange(args) => run_observation(ObservationKind::WaitChange, &args),
         Command::WaitStable(args) => run_observation(ObservationKind::WaitStable, &args),
         Command::Observe(args) => run_observation(ObservationKind::Observe, &args),
+        Command::Serve(args) => eensh::service::client::run_serve(&args),
+        Command::Ping(args) => eensh::service::client::run_ping(&args),
+        Command::Session(args) => eensh::service::client::run_session(&args.command),
     }
 }
 

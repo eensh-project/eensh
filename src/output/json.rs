@@ -1,0 +1,299 @@
+//! The stable JSON response shape.
+//!
+//! The response deliberately keeps three groups of numbers apart, because
+//! conflating them is the classic way to make an agent-facing screenshot tool
+//! ambiguous:
+//!
+//! * `source` — where the pixels came from, in source-desktop pixels;
+//! * `image` — the returned image, in its own pixels;
+//! * `transform` — the explicit mapping between the two.
+//!
+//! Nothing in the response asks the caller to guess which coordinate space a
+//! width belongs to.
+
+use serde::{Deserialize, Serialize};
+
+use crate::encode::EncodedImage;
+use crate::geometry::{SourceGeometry, Transform};
+use crate::timing::Timing;
+
+/// The returned image, independent of where it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSection {
+    /// Width of the returned image, in image pixels.
+    pub width: u32,
+    /// Height of the returned image, in image pixels.
+    pub height: u32,
+    /// IANA media type, for example `image/jpeg`.
+    pub media_type: String,
+    /// Canonical format name, for example `jpeg`.
+    pub format: String,
+    /// Size of the encoded image in bytes.
+    pub byte_length: usize,
+    /// Encoding of [`ImageSection::data`], when inline data is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// Inline base64 image data, when `--base64` was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// JPEG quality, when the image is a JPEG.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<u8>,
+}
+
+/// A complete capture response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CaptureResponse {
+    /// Source geometry, in source-desktop pixels.
+    pub source: SourceGeometry,
+    /// The returned image.
+    pub image: ImageSection,
+    /// Mapping from image coordinates back to source coordinates.
+    pub transform: Transform,
+    /// Per-stage timings in microseconds.
+    pub timing: Timing,
+}
+
+impl CaptureResponse {
+    /// Assemble a response from its parts.
+    pub fn new(
+        source: SourceGeometry,
+        encoded: &EncodedImage,
+        transform: Transform,
+        timing: Timing,
+        base64_data: Option<String>,
+        quality: Option<u8>,
+    ) -> Self {
+        CaptureResponse {
+            source,
+            image: ImageSection {
+                width: encoded.width,
+                height: encoded.height,
+                media_type: encoded.media_type().to_string(),
+                format: encoded.format.name().to_string(),
+                byte_length: encoded.bytes.len(),
+                encoding: base64_data.as_ref().map(|_| "base64".to_string()),
+                data: base64_data,
+                quality,
+            },
+            transform,
+            timing,
+        }
+    }
+
+    /// Serialize to compact JSON followed by a newline.
+    pub fn to_json_string(&self) -> Result<String, crate::error::Error> {
+        serde_json::to_string(self)
+            .map(|mut text| {
+                text.push('\n');
+                text
+            })
+            .map_err(|e| {
+                crate::error::Error::Internal(format!(
+                    "capture response could not be serialized: {e}"
+                ))
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::{ImageFormat, PngEffort};
+    use crate::geometry::CaptureTarget;
+    use serde_json::{json, Value};
+
+    fn encoded(width: u32, height: u32) -> EncodedImage {
+        EncodedImage {
+            bytes: vec![0u8; 128],
+            format: ImageFormat::Jpeg,
+            width,
+            height,
+        }
+    }
+
+    fn timing() -> Timing {
+        Timing {
+            capture_us: 910,
+            resize_us: 620,
+            encode_us: 3870,
+            base64_us: 330,
+            total_us: 5730,
+        }
+    }
+
+    fn desktop_source() -> SourceGeometry {
+        SourceGeometry::desktop(Some(":99".into()), 1920, 1080)
+    }
+
+    #[test]
+    fn desktop_response_distinguishes_source_and_image_dimensions() {
+        let source = desktop_source();
+        let transform = Transform::new(&source.rect(), 960, 540).unwrap();
+        let response = CaptureResponse::new(
+            source,
+            &encoded(960, 540),
+            transform,
+            timing(),
+            Some("AAAA".into()),
+            Some(75),
+        );
+        let value: Value = serde_json::from_str(&response.to_json_string().unwrap()).unwrap();
+
+        // Source geometry is in source pixels.
+        assert_eq!(value["source"]["kind"], "desktop");
+        assert_eq!(value["source"]["display"], ":99");
+        assert_eq!(value["source"]["width"], 1920);
+        assert_eq!(value["source"]["height"], 1080);
+
+        // Image geometry is in image pixels.
+        assert_eq!(value["image"]["width"], 960);
+        assert_eq!(value["image"]["height"], 540);
+        assert_eq!(value["image"]["media_type"], "image/jpeg");
+        assert_eq!(value["image"]["format"], "jpeg");
+        assert_eq!(value["image"]["encoding"], "base64");
+        assert_eq!(value["image"]["data"], "AAAA");
+        assert_eq!(value["image"]["quality"], 75);
+
+        // The transform is explicit.
+        assert_eq!(value["transform"]["origin"], "top-left");
+        assert_eq!(value["transform"]["scale_x"], 2.0);
+        assert_eq!(value["transform"]["scale_y"], 2.0);
+    }
+
+    #[test]
+    fn region_response_reports_the_region_origin_in_the_transform() {
+        let source = SourceGeometry::region(Some(":99".into()), 100, 200, 800, 600);
+        let transform = Transform::new(&source.rect(), 400, 300).unwrap();
+        let response =
+            CaptureResponse::new(source, &encoded(400, 300), transform, timing(), None, None);
+        let value: Value = serde_json::from_str(&response.to_json_string().unwrap()).unwrap();
+
+        assert_eq!(value["source"]["kind"], "region");
+        assert_eq!(value["source"]["x"], 100);
+        assert_eq!(value["source"]["y"], 200);
+        assert_eq!(value["transform"]["offset_x"], 100);
+        assert_eq!(value["transform"]["offset_y"], 200);
+        assert_eq!(value["transform"]["scale_x"], 2.0);
+        // Without --base64 there is no encoding or data.
+        assert!(value["image"].get("encoding").is_none());
+        assert!(value["image"].get("data").is_none());
+    }
+
+    #[test]
+    fn unresized_capture_has_a_unit_transform() {
+        let source =
+            SourceGeometry::window(Some(":99".into()), "0x4600007".into(), 10, 20, 640, 480);
+        let transform = Transform::new(&source.rect(), 640, 480).unwrap();
+        let response =
+            CaptureResponse::new(source, &encoded(640, 480), transform, timing(), None, None);
+        let value: Value = serde_json::from_str(&response.to_json_string().unwrap()).unwrap();
+        assert_eq!(value["source"]["kind"], "window");
+        assert_eq!(value["source"]["id"], "0x4600007");
+        assert_eq!(value["transform"]["scale_x"], 1.0);
+        assert_eq!(value["transform"]["scale_y"], 1.0);
+        assert_eq!(value["transform"]["offset_x"], 10);
+        assert_eq!(value["transform"]["offset_y"], 20);
+    }
+
+    #[test]
+    fn timings_are_present_for_every_stage() {
+        let source = desktop_source();
+        let transform = Transform::new(&source.rect(), 1920, 1080).unwrap();
+        let response = CaptureResponse::new(
+            source,
+            &encoded(1920, 1080),
+            transform,
+            timing(),
+            None,
+            None,
+        );
+        let value: Value = serde_json::from_str(&response.to_json_string().unwrap()).unwrap();
+        for field in [
+            "capture_us",
+            "resize_us",
+            "encode_us",
+            "base64_us",
+            "total_us",
+        ] {
+            assert!(
+                value["timing"][field].is_u64(),
+                "timing.{field} missing or not an integer"
+            );
+        }
+    }
+
+    #[test]
+    fn response_is_stable_across_serializations() {
+        let source = desktop_source();
+        let transform = Transform::new(&source.rect(), 960, 540).unwrap();
+        let response = CaptureResponse::new(
+            source,
+            &encoded(960, 540),
+            transform,
+            timing(),
+            Some("AAAA".into()),
+            Some(80),
+        );
+        assert_eq!(
+            response.to_json_string().unwrap(),
+            response.to_json_string().unwrap()
+        );
+    }
+
+    #[test]
+    fn error_response_has_the_documented_shape() {
+        let error = crate::error::Error::WindowNotFound {
+            window_id: "0x1".into(),
+        };
+        assert_eq!(
+            error.to_json(),
+            json!({
+                "error": {
+                    "code": "window_not_found",
+                    "message": "X11 window not found: 0x1",
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn png_media_type_is_reported_for_png_output() {
+        let source = desktop_source();
+        let transform = Transform::new(&source.rect(), 100, 100).unwrap();
+        let encoded = EncodedImage {
+            bytes: vec![0u8; 10],
+            format: ImageFormat::Png,
+            width: 100,
+            height: 100,
+        };
+        let response = CaptureResponse::new(source, &encoded, transform, timing(), None, None);
+        let value: Value = serde_json::from_str(&response.to_json_string().unwrap()).unwrap();
+        assert_eq!(value["image"]["media_type"], "image/png");
+        assert_eq!(value["image"]["format"], "png");
+        assert!(value["image"].get("quality").is_none());
+        let _ = PngEffort::Default;
+    }
+
+    #[test]
+    fn source_target_round_trips_through_json() {
+        let cases = [
+            CaptureTarget::Desktop,
+            CaptureTarget::Region,
+            CaptureTarget::Window { id: "0x2".into() },
+        ];
+        for target in cases {
+            let source = SourceGeometry {
+                target: target.clone(),
+                display: Some(":99".into()),
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4,
+            };
+            let text = serde_json::to_string(&source).unwrap();
+            let back: SourceGeometry = serde_json::from_str(&text).unwrap();
+            assert_eq!(back, source, "round trip failed for {target:?}");
+        }
+    }
+}

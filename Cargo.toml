@@ -1,0 +1,42 @@
+[package]
+name = "eensh"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Fast, deterministic X11 screenshot capture utility designed for software agents"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["screenshot", "x11", "agent", "capture", "automation"]
+categories = ["command-line-utilities", "multimedia::images"]
+
+[dependencies]
+# Command line interface.
+clap = { version = "4", features = ["derive"] }
+
+# Stable machine readable output.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Base64 encoding of already-encoded image bytes.
+base64 = "0.22"
+
+# PNG encoding (pure Rust).
+png = "0.18"
+
+# JPEG encoding. Only the JPEG codec is enabled so the dependency graph stays
+# small and portable; no system libjpeg is required.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+# X11 bindings that load libX11 dynamically at runtime. This avoids requiring
+# X11 development headers at build time, which matters for portability.
+x11-dl = "2"
+
+[dev-dependencies]
+# Used by the integration tests to render known content into an Xvfb display.
+x11-dl = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

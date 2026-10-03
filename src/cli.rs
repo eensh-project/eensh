@@ -8,15 +8,19 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 
 use crate::capture::CaptureRequest;
 use crate::compare::{CompareMode, CompareOptions};
 use crate::encode::{jpeg, ImageFormat, PngEffort};
 use crate::error::Error;
 use crate::geometry::Rect;
-use crate::output::{Destination, OutputPlan};
+use crate::observe::{ObserveOptions, TemporalCompareOptions, WaitStableOptions};
+use crate::output::{Destination, MetadataDestination, OutputPlan};
+use crate::pipeline::ImageOptions;
 
 /// `eensh` — agent-ready X11 screenshot capture.
 #[derive(Debug, Parser)]
@@ -42,6 +46,210 @@ pub enum Command {
     Capture(Box<CaptureArgs>),
     /// Compare two saved images and report what changed.
     Diff(Box<DiffArgs>),
+    /// Wait until the target changes meaningfully, then return the changed frame.
+    #[command(name = "wait-change")]
+    WaitChange(Box<ObservationArgs>),
+    /// Wait until the target stops changing, then return the settled frame.
+    #[command(name = "wait-stable")]
+    WaitStable(Box<ObservationArgs>),
+    /// Wait for a visual transition, then wait for it to settle.
+    Observe(Box<ObservationArgs>),
+}
+
+/// Which temporal operation is being run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationKind {
+    /// `wait-change`.
+    WaitChange,
+    /// `wait-stable`.
+    WaitStable,
+    /// `observe`.
+    Observe,
+}
+
+impl ObservationKind {
+    /// Canonical snake-case name used in JSON.
+    pub fn name(self) -> &'static str {
+        match self {
+            ObservationKind::WaitChange => "wait_change",
+            ObservationKind::WaitStable => "wait_stable",
+            ObservationKind::Observe => "observe",
+        }
+    }
+}
+
+impl std::fmt::Display for ObservationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Arguments shared by `wait-change`, `wait-stable`, and `observe`.
+///
+/// The target and image options are the Phase 1 ones, reused rather than
+/// reimplemented, so that an observation is configured exactly like a capture.
+#[derive(Debug, Args)]
+pub struct ObservationArgs {
+    /// Output path for the final frame, or `-` for stdout. Omitted means stdout.
+    #[arg(value_name = "OUTPUT")]
+    pub output: Option<String>,
+
+    /// X11 display to capture from, for example `:99`. Overrides `$DISPLAY`.
+    #[arg(long, value_name = "DISPLAY")]
+    pub display: Option<String>,
+
+    /// Rectangle to observe, as `X,Y,WIDTH,HEIGHT` in source-desktop pixels.
+    #[arg(
+        long,
+        value_name = "X,Y,W,H",
+        value_parser = parse_region,
+        allow_hyphen_values = true,
+        conflicts_with = "window"
+    )]
+    pub region: Option<Rect>,
+
+    /// X11 window ID to observe, decimal or `0x`-prefixed hexadecimal.
+    #[arg(
+        long,
+        value_name = "WINDOW_ID",
+        value_parser = parse_window_id,
+        conflicts_with = "region"
+    )]
+    pub window: Option<u64>,
+
+    /// Comparison mode for change detection: `exact` or `rgb`.
+    #[arg(long, value_name = "MODE")]
+    pub mode: Option<String>,
+
+    /// Largest per-channel difference treated as unchanged, 0-255.
+    #[arg(long, value_name = "0-255", value_parser = clap::value_parser!(u8))]
+    pub pixel_threshold: Option<u8>,
+
+    /// Smallest changed fraction treated as meaningful change, 0.0-1.0.
+    #[arg(long, value_name = "0.0-1.0", value_parser = parse_area_threshold)]
+    pub area_threshold: Option<f64>,
+
+    /// Target cadence between samples, for example `100ms`.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub interval: Option<Duration>,
+
+    /// Total deadline for the whole operation, for example `5s`.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub timeout: Option<Duration>,
+
+    /// How long the scene must hold still, for `wait-stable` and `observe`.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub stable_for: Option<Duration>,
+
+    /// Output image format: `png` or `jpeg`. Inferred from the extension.
+    #[arg(long, value_name = "FORMAT")]
+    pub format: Option<String>,
+
+    /// JPEG quality, 1-100. Only valid with JPEG output.
+    #[arg(long, value_name = "QUALITY", value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub quality: Option<u8>,
+
+    /// Resize the returned frame to this width, preserving the aspect ratio.
+    #[arg(
+        long,
+        value_name = "WIDTH",
+        value_parser = clap::value_parser!(u32).range(1..),
+        conflicts_with = "scale"
+    )]
+    pub width: Option<u32>,
+
+    /// Resize the returned frame to this height, preserving the aspect ratio.
+    #[arg(
+        long,
+        value_name = "HEIGHT",
+        value_parser = clap::value_parser!(u32).range(1..),
+        conflicts_with = "scale"
+    )]
+    pub height: Option<u32>,
+
+    /// Resize the returned frame by this factor, preserving the aspect ratio.
+    #[arg(
+        long,
+        value_name = "FACTOR",
+        value_parser = parse_scale,
+        conflicts_with_all = ["width", "height"]
+    )]
+    pub scale: Option<f64>,
+
+    /// PNG compression effort: `fast`, `default`, or `best`.
+    #[arg(long, value_name = "EFFORT")]
+    pub compression: Option<String>,
+
+    /// Embed the final frame in the JSON response as base64.
+    #[arg(long)]
+    pub base64: bool,
+
+    /// Emit a stable JSON response instead of a one-line summary.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Print observation timings to stderr.
+    #[arg(long)]
+    pub time: bool,
+}
+
+/// Which display and target an observation watches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveTarget {
+    /// The display to capture from.
+    pub display: String,
+    /// What to capture each time.
+    pub request: CaptureRequest,
+}
+
+/// A fully resolved `wait-change`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedWaitChange {
+    /// The observed target.
+    pub target: ResolveTarget,
+    /// Comparison settings, cadence, and deadline.
+    pub temporal: TemporalCompareOptions,
+    /// Image settings for the final frame.
+    pub image: ImageOptions,
+    /// Where the result goes.
+    pub output: OutputPlan,
+    /// Whether to print timings.
+    pub print_timing: bool,
+}
+
+/// A fully resolved `wait-stable`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedWaitStable {
+    /// The observed target.
+    pub target: ResolveTarget,
+    /// Comparison settings, cadence, and deadline.
+    pub temporal: TemporalCompareOptions,
+    /// How long the scene must hold still.
+    pub stable_for: Duration,
+    /// Image settings for the final frame.
+    pub image: ImageOptions,
+    /// Where the result goes.
+    pub output: OutputPlan,
+    /// Whether to print timings.
+    pub print_timing: bool,
+}
+
+/// A fully resolved `observe`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedObserve {
+    /// The observed target.
+    pub target: ResolveTarget,
+    /// Comparison settings, cadence, and deadline.
+    pub temporal: TemporalCompareOptions,
+    /// How long the settled scene must hold still.
+    pub stable_for: Duration,
+    /// Image settings for the final frame.
+    pub image: ImageOptions,
+    /// Where the result goes.
+    pub output: OutputPlan,
+    /// Whether to print timings.
+    pub print_timing: bool,
 }
 
 /// Arguments for `eensh diff`.
@@ -423,6 +631,272 @@ fn parse_area_threshold(text: &str) -> Result<f64, String> {
         ));
     }
     Ok(value)
+}
+
+/// Parse a human-readable duration such as `100ms`, `300ms`, `1s`, or `5s`.
+///
+/// The accepted surface is deliberately narrow: a non-negative number followed by
+/// `ms` or `s`. Bare numbers are rejected rather than guessed at, because
+/// `--timeout 5` is ambiguous between five seconds and five milliseconds, and a
+/// silently wrong timeout is worse than a parse error. A zero duration parses
+/// here and is rejected by the operation's own validation, so the error message
+/// can name the specific setting.
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("duration must not be empty".to_string());
+    }
+
+    let (number, unit) = if let Some(number) = trimmed.strip_suffix("ms") {
+        (number, "ms")
+    } else if let Some(number) = trimmed.strip_suffix('s') {
+        (number, "s")
+    } else {
+        return Err(format!(
+            "{text:?} is not a duration; use a unit suffix, for example 100ms, 300ms, 1s, 5s"
+        ));
+    };
+
+    let value: f64 = number
+        .trim()
+        .parse()
+        .map_err(|_| format!("{number:?} is not a number"))?;
+
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("duration {text:?} must be zero or greater"));
+    }
+
+    let nanos = match unit {
+        "ms" => value * 1_000_000.0,
+        _ => value * 1_000_000_000.0,
+    };
+
+    if nanos > u64::MAX as f64 {
+        return Err(format!("duration {text:?} is too large"));
+    }
+
+    Ok(Duration::from_nanos(nanos.round() as u64))
+}
+
+impl ObservationArgs {
+    /// Resolve the display and target, shared by all three operations.
+    fn resolve_target(&self) -> Result<ResolveTarget, Error> {
+        let display = if let Some(display) = self.display.as_deref() {
+            if display.is_empty() {
+                return Err(Error::InvalidArguments(
+                    "--display was given an empty value".to_string(),
+                ));
+            }
+            display.to_string()
+        } else {
+            match env::var("DISPLAY") {
+                Ok(display) if !display.is_empty() => display,
+                _ => {
+                    return Err(Error::invalid_arguments(
+                        "no X11 display was specified and DISPLAY is not set; pass --display, \
+                         for example --display :99",
+                    ))
+                }
+            }
+        };
+
+        let request = if let Some(window) = self.window {
+            CaptureRequest::Window(window)
+        } else if let Some(region) = self.region {
+            CaptureRequest::Region(region)
+        } else {
+            CaptureRequest::Desktop
+        };
+
+        Ok(ResolveTarget { display, request })
+    }
+
+    /// Resolve comparison, cadence, and deadline.
+    ///
+    /// The defaults are the documented temporal profile, which is *not* the same
+    /// as `eensh diff`'s: `diff` asks "did anything differ?", observation asks
+    /// "did anything meaningfully change?".
+    fn resolve_temporal(&self) -> Result<TemporalCompareOptions, Error> {
+        let default = TemporalCompareOptions::default();
+
+        let mode = match self.mode.as_deref() {
+            Some(name) => CompareMode::from_name(name)?,
+            None => default.compare.mode,
+        };
+
+        let temporal = TemporalCompareOptions {
+            compare: CompareOptions {
+                mode,
+                pixel_threshold: self
+                    .pixel_threshold
+                    .unwrap_or(default.compare.pixel_threshold),
+                area_threshold: self
+                    .area_threshold
+                    .unwrap_or(default.compare.area_threshold),
+            },
+            interval: self.interval.unwrap_or(default.interval),
+            timeout: self.timeout.unwrap_or(default.timeout),
+        };
+
+        temporal.validate()?;
+        Ok(temporal)
+    }
+
+    /// Resolve the image settings for the final returned frame.
+    ///
+    /// Reuses the Phase 1 resolution rules exactly, because the returned frame is
+    /// presented the same way a capture is.
+    fn resolve_image(&self) -> Result<ImageOptions, Error> {
+        let destination = Destination::from_argument(self.output.as_deref());
+
+        let format = match self.format.as_deref() {
+            Some(name) => ImageFormat::from_name(name)?,
+            None => match &destination {
+                Destination::File(path) => ImageFormat::from_path(path).unwrap_or(ImageFormat::Png),
+                Destination::Stdout => ImageFormat::Png,
+            },
+        };
+
+        let quality =
+            match (self.quality, format) {
+                (Some(_), ImageFormat::Png) => return Err(Error::invalid_arguments(
+                    "--quality applies only to JPEG output; add --format jpeg or drop --quality",
+                )),
+                (Some(quality), _) => quality,
+                (None, _) => jpeg::DEFAULT_QUALITY,
+            };
+
+        let png_effort = match (self.compression.as_deref(), format) {
+            (Some(_), ImageFormat::Jpeg) => {
+                return Err(Error::invalid_arguments(
+                    "--compression applies only to PNG output; add --format png or drop it",
+                ))
+            }
+            (Some(name), _) => PngEffort::from_name(name)?,
+            (None, _) => PngEffort::Default,
+        };
+
+        Ok(ImageOptions {
+            resize: self.resolve_resize()?,
+            format,
+            quality,
+            png_effort,
+            base64: self.base64,
+        })
+    }
+
+    /// Decide the resize request for the returned frame.
+    fn resolve_resize(&self) -> Result<ResizeRequest, Error> {
+        if self.width.is_some() && self.height.is_some() {
+            return Err(Error::invalid_arguments(
+                "--width and --height cannot be combined: Phase 1 only supports proportional \
+                 resizing. Use one of them, or --scale.",
+            ));
+        }
+        if let Some(width) = self.width {
+            return Ok(ResizeRequest::Width(width));
+        }
+        if let Some(height) = self.height {
+            return Ok(ResizeRequest::Height(height));
+        }
+        if let Some(scale) = self.scale {
+            return Ok(ResizeRequest::Scale(scale));
+        }
+        Ok(ResizeRequest::None)
+    }
+
+    /// Resolve the output plan.
+    ///
+    /// Observation uses a simpler rule than `capture`, because the JSON *is* the
+    /// result here rather than an optional annotation:
+    ///
+    /// * the JSON always goes to stdout;
+    /// * the frame is written only to a **file**, or embedded in the JSON with
+    ///   `--base64`;
+    /// * raw binary is never written to stdout.
+    ///
+    /// `capture` can put binary on stdout and metadata on stderr because its
+    /// primary product is the image. An observation's primary product is the
+    /// observation itself, so burying it on stderr while binary lands on stdout
+    /// would be backwards, and interleaving the two would corrupt both. `-` is
+    /// therefore accepted and means "JSON to stdout", which is already the
+    /// default.
+    fn resolve_output(&self) -> Result<OutputPlan, Error> {
+        if !self.json {
+            return Err(Error::invalid_arguments(
+                "observation commands are agent-facing and require --json; add --json to receive \
+                 the observation result. Use `eensh capture` for plain image output.",
+            ));
+        }
+
+        let destination = Destination::from_argument(self.output.as_deref());
+        let write_image_bytes = matches!(destination, Destination::File(_));
+
+        Ok(OutputPlan {
+            destination,
+            metadata: MetadataDestination::Stdout,
+            write_image_bytes,
+        })
+    }
+
+    /// Resolve a `wait-change` invocation.
+    pub fn resolve_wait_change(&self) -> Result<ResolvedWaitChange, Error> {
+        Ok(ResolvedWaitChange {
+            target: self.resolve_target()?,
+            temporal: self.resolve_temporal()?,
+            image: self.resolve_image()?,
+            output: self.resolve_output()?,
+            print_timing: self.time,
+        })
+    }
+
+    /// Resolve a `wait-stable` invocation.
+    pub fn resolve_wait_stable(&self) -> Result<ResolvedWaitStable, Error> {
+        let temporal = self.resolve_temporal()?;
+        let stable_for = self
+            .stable_for
+            .unwrap_or_else(|| WaitStableOptions::default().stable_for);
+
+        // Validate here rather than at the engine, so a bad setting fails before
+        // a display is opened or a single frame is captured.
+        WaitStableOptions {
+            temporal,
+            stable_for,
+        }
+        .validate()?;
+
+        Ok(ResolvedWaitStable {
+            target: self.resolve_target()?,
+            temporal,
+            stable_for,
+            image: self.resolve_image()?,
+            output: self.resolve_output()?,
+            print_timing: self.time,
+        })
+    }
+
+    /// Resolve an `observe` invocation.
+    pub fn resolve_observe(&self) -> Result<ResolvedObserve, Error> {
+        let temporal = self.resolve_temporal()?;
+        let stable_for = self
+            .stable_for
+            .unwrap_or_else(|| ObserveOptions::with_defaults().stable_for);
+
+        ObserveOptions {
+            temporal,
+            stable_for,
+        }
+        .validate()?;
+
+        Ok(ResolvedObserve {
+            target: self.resolve_target()?,
+            temporal,
+            stable_for,
+            image: self.resolve_image()?,
+            output: self.resolve_output()?,
+            print_timing: self.time,
+        })
+    }
 }
 
 impl DiffArgs {
@@ -881,5 +1355,253 @@ mod tests {
         let resolved = diff_args(&["--json", "--time"]).resolve().unwrap();
         assert!(resolved.json);
         assert!(resolved.print_timing);
+    }
+
+    // --- observation argument resolution -------------------------------------
+
+    fn observation(args_for: &str, extra: &[&str]) -> ObservationArgs {
+        let mut argv = vec!["eensh", args_for];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).expect("arguments should parse");
+        match cli.command {
+            Command::WaitChange(args) | Command::WaitStable(args) | Command::Observe(args) => *args,
+            other => panic!("expected an observation command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duration_parsing_accepts_milliseconds_and_seconds() {
+        assert_eq!(parse_duration("100ms").unwrap(), Duration::from_millis(100));
+        assert_eq!(parse_duration("300ms").unwrap(), Duration::from_millis(300));
+        assert_eq!(parse_duration("1s").unwrap(), Duration::from_secs(1));
+        assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
+        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
+        assert_eq!(
+            parse_duration(" 250ms ").unwrap(),
+            Duration::from_millis(250)
+        );
+        assert_eq!(parse_duration("1.5s").unwrap(), Duration::from_millis(1500));
+        // Zero parses; the operation's validation rejects it with a named error.
+        assert_eq!(parse_duration("0ms").unwrap(), Duration::ZERO);
+    }
+
+    #[test]
+    fn duration_parsing_rejects_the_ambiguous_and_the_invalid() {
+        for bad in [
+            "5",
+            "",
+            "s",
+            "ms",
+            "abc",
+            "-1s",
+            "-100ms",
+            "5m",
+            "5 seconds",
+            "inf",
+            "nan",
+        ] {
+            assert!(
+                parse_duration(bad).is_err(),
+                "{bad:?} should be rejected as a duration"
+            );
+        }
+    }
+
+    #[test]
+    fn observation_defaults_are_the_documented_profile() {
+        let resolved = observation("observe", &["--json"])
+            .resolve_observe()
+            .unwrap();
+
+        assert_eq!(resolved.temporal.compare.mode, CompareMode::RgbThreshold);
+        assert_eq!(resolved.temporal.compare.pixel_threshold, 12);
+        assert_eq!(resolved.temporal.compare.area_threshold, 0.005);
+        assert_eq!(resolved.temporal.interval, Duration::from_millis(100));
+        assert_eq!(resolved.temporal.timeout, Duration::from_secs(5));
+        assert_eq!(resolved.stable_for, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn observation_options_override_the_defaults() {
+        let resolved = observation(
+            "observe",
+            &[
+                "--json",
+                "--mode",
+                "exact",
+                "--pixel-threshold",
+                "0",
+                "--area-threshold",
+                "0.02",
+                "--interval",
+                "50ms",
+                "--timeout",
+                "10s",
+                "--stable-for",
+                "500ms",
+            ],
+        )
+        .resolve_observe()
+        .unwrap();
+
+        assert_eq!(resolved.temporal.compare.mode, CompareMode::Exact);
+        assert_eq!(resolved.temporal.compare.pixel_threshold, 0);
+        assert_eq!(resolved.temporal.compare.area_threshold, 0.02);
+        assert_eq!(resolved.temporal.interval, Duration::from_millis(50));
+        assert_eq!(resolved.temporal.timeout, Duration::from_secs(10));
+        assert_eq!(resolved.stable_for, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_zero_interval_is_rejected_with_a_named_error() {
+        let error = observation("observe", &["--json", "--interval", "0ms"])
+            .resolve_observe()
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_duration");
+        assert!(error.message().contains("interval"));
+    }
+
+    #[test]
+    fn a_zero_timeout_is_rejected_with_a_named_error() {
+        let error = observation("wait-change", &["--json", "--timeout", "0s"])
+            .resolve_wait_change()
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_duration");
+        assert!(error.message().contains("timeout"));
+    }
+
+    #[test]
+    fn a_zero_stable_duration_is_rejected_rather_than_meaning_instantly_stable() {
+        for command in ["wait-stable", "observe"] {
+            let error = if command == "wait-stable" {
+                observation(command, &["--json", "--stable-for", "0ms"])
+                    .resolve_wait_stable()
+                    .unwrap_err()
+            } else {
+                observation(command, &["--json", "--stable-for", "0ms"])
+                    .resolve_observe()
+                    .unwrap_err()
+            };
+            assert_eq!(error.code(), "invalid_duration", "{command}");
+            assert!(error.message().contains("stable duration"), "{command}");
+        }
+    }
+
+    #[test]
+    fn observation_requires_json() {
+        // Observation is agent-facing; a plain image write would lose the
+        // temporal result entirely.
+        let error = observation("wait-change", &[])
+            .resolve_wait_change()
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_arguments");
+        assert!(error.message().contains("--json"));
+    }
+
+    #[test]
+    fn observation_targets_resolve_like_capture_targets() {
+        let resolved = observation(
+            "observe",
+            &["--json", "--display", ":77", "--region", "1,2,3,4"],
+        )
+        .resolve_observe()
+        .unwrap();
+        assert_eq!(resolved.target.display, ":77");
+        assert_eq!(
+            resolved.target.request,
+            CaptureRequest::Region(Rect::new(1, 2, 3, 4).unwrap())
+        );
+
+        let resolved = observation(
+            "observe",
+            &["--json", "--display", ":77", "--window", "0x10"],
+        )
+        .resolve_observe()
+        .unwrap();
+        assert_eq!(resolved.target.request, CaptureRequest::Window(0x10));
+
+        let resolved = observation("observe", &["--json", "--display", ":77"])
+            .resolve_observe()
+            .unwrap();
+        assert_eq!(resolved.target.request, CaptureRequest::Desktop);
+    }
+
+    #[test]
+    fn observation_reuses_the_capture_image_options() {
+        let resolved = observation(
+            "observe",
+            &[
+                "--json",
+                "--display",
+                ":77",
+                "--width",
+                "960",
+                "--format",
+                "jpeg",
+                "--quality",
+                "75",
+                "--base64",
+            ],
+        )
+        .resolve_observe()
+        .unwrap();
+
+        assert_eq!(resolved.image.resize, ResizeRequest::Width(960));
+        assert_eq!(resolved.image.format, ImageFormat::Jpeg);
+        assert_eq!(resolved.image.quality, 75);
+        assert!(resolved.image.base64);
+    }
+
+    #[test]
+    fn observation_rejects_quality_for_png_output() {
+        let error = observation(
+            "observe",
+            &["--json", "--display", ":77", "--quality", "75"],
+        )
+        .resolve_observe()
+        .unwrap_err();
+        assert_eq!(error.code(), "invalid_arguments");
+    }
+
+    #[test]
+    fn observation_rejects_malformed_targets() {
+        assert!(Cli::try_parse_from(["eensh", "observe", "--region", "1,2,3"]).is_err());
+        assert!(Cli::try_parse_from(["eensh", "observe", "--window", "nope"]).is_err());
+        assert!(Cli::try_parse_from([
+            "eensh", "observe", "--region", "0,0,1,1", "--window", "0x1"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn observation_kind_names_are_stable() {
+        assert_eq!(ObservationKind::WaitChange.name(), "wait_change");
+        assert_eq!(ObservationKind::WaitStable.name(), "wait_stable");
+        assert_eq!(ObservationKind::Observe.name(), "observe");
+        assert_eq!(
+            serde_json::to_value(ObservationKind::WaitChange).unwrap(),
+            serde_json::json!("wait_change")
+        );
+    }
+
+    #[test]
+    fn wait_stable_resolves_its_stable_duration() {
+        let resolved = observation("wait-stable", &["--json", "--stable-for", "750ms"])
+            .resolve_wait_stable()
+            .unwrap();
+        assert_eq!(resolved.stable_for, Duration::from_millis(750));
+
+        // And defaults without the flag.
+        let resolved = observation("wait-stable", &["--json"])
+            .resolve_wait_stable()
+            .unwrap();
+        assert_eq!(resolved.stable_for, Duration::from_millis(300));
+    }
+
+    #[test]
+    fn a_time_relative_threshold_is_not_confused_with_the_interval() {
+        // Guard against mixing up --area-threshold (a fraction) with a duration.
+        assert!(Cli::try_parse_from(["eensh", "observe", "--area-threshold", "100ms"]).is_err());
+        assert!(Cli::try_parse_from(["eensh", "observe", "--interval", "0.005"]).is_err());
     }
 }

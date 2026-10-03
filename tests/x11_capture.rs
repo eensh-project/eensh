@@ -183,6 +183,11 @@ fn resizing_produces_the_transformed_geometry_and_coordinates() {
     };
 
     // SCREEN_W x SCREEN_H (640x480) halved is exactly 320x240.
+    //
+    // The image goes to a file so that stdout is free for the JSON. Writing
+    // binary to stdout alongside `--json` puts the JSON on stderr instead, which
+    // is the documented `capture` rule and would make this parse the wrong stream.
+    let path = temp_file("resize", "half.png");
     let (code, stdout, stderr) = run_eensh_text(&[
         "capture",
         "--display",
@@ -192,7 +197,7 @@ fn resizing_produces_the_transformed_geometry_and_coordinates() {
         "--format",
         "png",
         "--json",
-        "-",
+        path.to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "capture failed: {stderr}");
 
@@ -205,6 +210,10 @@ fn resizing_produces_the_transformed_geometry_and_coordinates() {
     assert_eq!(response["transform"]["scale_y"], 2.0);
     assert_eq!(response["transform"]["offset_x"], 0);
     assert_eq!(response["transform"]["offset_y"], 0);
+
+    // The resized file really is 320x240.
+    let image = decode_png(&std::fs::read(&path).unwrap());
+    assert_eq!((image.width, image.height), (320, 240));
 }
 
 #[test]

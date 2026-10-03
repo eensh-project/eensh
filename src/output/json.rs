@@ -184,6 +184,189 @@ impl DiffResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Temporal observation responses
+// ---------------------------------------------------------------------------
+
+/// Timings for preparing the single returned frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationOutputTiming {
+    /// Resize, in microseconds.
+    pub resize_us: u64,
+    /// Encode, in microseconds.
+    pub encode_us: u64,
+    /// Base64, in microseconds.
+    pub base64_us: u64,
+}
+
+/// Timings for a temporal observation.
+///
+/// The point of these numbers is to answer three questions without a profiler:
+/// are we slow because capture is slow, because comparison is slow, or because
+/// we are mostly sleeping between polls?
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationTimingSection {
+    /// Frames captured.
+    pub captures: u64,
+    /// Frame pairs compared.
+    pub comparisons: u64,
+    /// Total time inside capture, in microseconds.
+    pub capture_us_total: u64,
+    /// Total time inside comparison, in microseconds.
+    pub compare_us_total: u64,
+    /// Total time deliberately waiting between samples, in microseconds.
+    pub sleep_us_total: u64,
+    /// Timings for preparing the one returned frame.
+    pub encode: ObservationOutputTiming,
+}
+
+/// The observation summary.
+///
+/// `result` is the authoritative statement of what happened. A timeout is
+/// reported here rather than as an error, so that "nothing happened" is never
+/// confused with "capture broke".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationSection {
+    /// Which operation ran.
+    pub kind: crate::cli::ObservationKind,
+    /// `changed`, `stable`, `observed`, or `timeout`.
+    pub result: crate::observe::Outcome,
+    /// Total elapsed time in milliseconds.
+    pub elapsed_ms: u64,
+    /// Frames captured.
+    pub captures: u64,
+    /// Frame pairs compared.
+    pub comparisons: u64,
+    /// Required stability duration, for the operations that have one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_for_ms: Option<u64>,
+    /// How long the scene had been still when it completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_duration_ms: Option<u64>,
+    /// When the first change was detected, for `observe`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_detected_ms: Option<u64>,
+}
+
+/// A comparison summarized inside a temporal result.
+///
+/// It carries the fields that describe the transition without repeating the
+/// option values, which appear on the frame's own `transform`/`image` pair and
+/// in the observation summary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransitionComparison {
+    /// Whether this comparison crossed the thresholds.
+    pub changed: bool,
+    /// Pixels that differed.
+    pub changed_pixels: u64,
+    /// Pixels compared.
+    pub total_pixels: u64,
+    /// Fraction that differed.
+    pub changed_fraction: f64,
+    /// Where the differences were.
+    pub bounding_box: Option<crate::geometry::Rect>,
+}
+
+impl TransitionComparison {
+    /// Summarize a Phase 2 comparison.
+    pub fn from_comparison(comparison: crate::compare::Comparison) -> Self {
+        TransitionComparison {
+            changed: comparison.changed,
+            changed_pixels: comparison.changed_pixels,
+            total_pixels: comparison.total_pixels,
+            changed_fraction: comparison.changed_fraction,
+            bounding_box: comparison.bounding_box,
+        }
+    }
+}
+
+/// The returned final frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedFrame {
+    /// Width of the returned image, in image pixels.
+    pub width: u32,
+    /// Height of the returned image, in image pixels.
+    pub height: u32,
+    /// IANA media type.
+    pub media_type: String,
+    /// Canonical format name.
+    pub format: String,
+    /// Size of the encoded image in bytes.
+    pub byte_length: usize,
+    /// Encoding of the inline data, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
+    /// Inline base64 image data, when requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// JPEG quality, when the image is a JPEG.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<u8>,
+}
+
+impl ObservedFrame {
+    /// Build from a prepared image and the options that produced it.
+    pub fn from_prepared(
+        prepared: &crate::pipeline::PreparedImage,
+        options: &crate::pipeline::ImageOptions,
+    ) -> Self {
+        ObservedFrame {
+            width: prepared.encoded.width,
+            height: prepared.encoded.height,
+            media_type: prepared.encoded.media_type().to_string(),
+            format: prepared.encoded.format.name().to_string(),
+            byte_length: prepared.encoded.bytes.len(),
+            encoding: prepared.data.as_ref().map(|_| "base64".to_string()),
+            data: prepared.data.clone(),
+            quality: prepared.quality(options),
+        }
+    }
+}
+
+/// A complete temporal observation response.
+///
+/// The structure mirrors the capture response deliberately: `source` is native
+/// source geometry, `image` is the returned image in its own pixels, and
+/// `transform` maps between them. An observation adds `observation` to describe
+/// the temporal outcome, plus the comparisons that explain it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObservationResponse {
+    /// What happened, temporally.
+    pub observation: ObservationSection,
+    /// Native source geometry of the observed target.
+    pub source: SourceGeometry,
+    /// Image-to-source coordinate mapping for the returned frame.
+    pub transform: Transform,
+    /// The returned frame.
+    pub image: ObservedFrame,
+    /// The relevant comparison: baseline-to-final for `wait-change`,
+    /// consecutive for `wait-stable`, and the final settling comparison for
+    /// `observe`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<TransitionComparison>,
+    /// The comparison that first detected a transition, for `observe`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_change: Option<TransitionComparison>,
+    /// Where the time went.
+    pub timing: ObservationTimingSection,
+}
+
+impl ObservationResponse {
+    /// Serialize to compact JSON followed by a newline.
+    pub fn to_json_string(&self) -> Result<String, crate::error::Error> {
+        serde_json::to_string(self)
+            .map(|mut text| {
+                text.push('\n');
+                text
+            })
+            .map_err(|e| {
+                crate::error::Error::Internal(format!(
+                    "observation response could not be serialized: {e}"
+                ))
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

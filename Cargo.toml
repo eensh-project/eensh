@@ -32,8 +32,10 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 x11-dl = "2"
 
 [dev-dependencies]
-# Used by the integration tests to render known content into an Xvfb display.
+# Used by the integration tests to render known content into an Xvfb display,
+# and to terminate Xvfb gracefully so it cleans up its own lock file.
 x11-dl = "2"
+libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [profile.release]

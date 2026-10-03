@@ -89,6 +89,7 @@ pub mod error;
 pub mod frame;
 pub mod geometry;
 pub mod input;
+pub mod observe;
 pub mod output;
 pub mod pipeline;
 pub mod resize;

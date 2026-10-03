@@ -101,6 +101,17 @@ impl TimingBuilder {
         self.timing.base64_us = stopwatch.stop();
     }
 
+    /// Record the resize, encode, and base64 stages from a prepared image.
+    ///
+    /// The shared presentation path in [`crate::pipeline::prepare_image`] times
+    /// those three stages itself, so they are copied across rather than measured
+    /// again here.
+    pub fn record(&mut self, prepared: &crate::pipeline::PreparedImage) {
+        self.timing.resize_us = prepared.resize_us;
+        self.timing.encode_us = prepared.encode_us;
+        self.timing.base64_us = prepared.base64_us;
+    }
+
     /// Finish and return the collected timings.
     pub fn finish(mut self) -> Timing {
         self.timing.total_us = self

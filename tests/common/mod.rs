@@ -23,7 +23,7 @@
 
 use std::cell::RefCell;
 use std::ffi::CString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -59,6 +59,7 @@ pub struct Xvfb {
     child: Child,
     display: String,
     socket: PathBuf,
+    lock: PathBuf,
 }
 
 impl Xvfb {
@@ -68,12 +69,16 @@ impl Xvfb {
     pub fn start(width: u32, height: u32) -> Option<Xvfb> {
         let binary = find_xvfb()?;
 
-        for number in 90..130u32 {
+        // A previous run that was hard-killed can leave a lock file behind; Xvfb
+        // itself checks the recorded PID before trusting a lock, so do the same
+        // and reclaim the display numbers instead of leaking them. This matters
+        // because the search range is finite.
+        remove_stale_locks();
+
+        for number in DISPLAY_RANGE {
             let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
             let lock = PathBuf::from(format!("/tmp/.X{number}-lock"));
-            // A live server holds both the socket and the lock. A stale socket
-            // with no lock is inert, but is skipped anyway so that the tests do
-            // not depend on the state of someone else's /tmp.
+            // A live server holds both the socket and the lock.
             if socket.exists() || lock.exists() {
                 continue;
             }
@@ -95,14 +100,14 @@ impl Xvfb {
                 child,
                 display,
                 socket,
+                lock,
             };
 
             if wait_for_display(&server.display, Duration::from_secs(10)) {
                 return Some(server);
             }
 
-            let _ = server.child.kill();
-            let _ = server.child.wait();
+            server.terminate();
         }
 
         None
@@ -112,19 +117,91 @@ impl Xvfb {
     pub fn display(&self) -> &str {
         &self.display
     }
-}
 
-impl Drop for Xvfb {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
+    /// Stop the server, giving it a chance to clean up after itself.
+    ///
+    /// `Child::kill` sends `SIGKILL`, which Xvfb cannot act on, so its lock file
+    /// would be left behind and the display number leaked. `SIGTERM` lets it shut
+    /// down properly; `SIGKILL` is only the fallback if it does not exit in time.
+    fn terminate(&mut self) {
+        let pid = self.child.id() as i32;
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => break,
+            }
+        }
+
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
+
         // Wait for the socket to disappear so an immediate rerun can reuse the
         // display number.
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline && self.socket.exists() {
             std::thread::sleep(Duration::from_millis(20));
         }
+
+        // If the server still did not clean up, remove the lock ourselves, but
+        // only when it really does belong to the process we just stopped.
+        remove_lock_if_owned(&self.lock, pid);
     }
+}
+
+impl Drop for Xvfb {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+/// The display numbers the harness will try.
+///
+/// Wide enough that a machine with many live or stale displays still finds a free
+/// one.
+const DISPLAY_RANGE: std::ops::Range<u32> = 90..400;
+
+/// Remove lock files whose recorded process is gone.
+///
+/// This mirrors what an X server does when it starts: a lock naming a dead PID is
+/// stale and may be reclaimed. Only genuinely stale locks in the harness's own
+/// range are touched.
+fn remove_stale_locks() {
+    for number in DISPLAY_RANGE {
+        let lock = PathBuf::from(format!("/tmp/.X{number}-lock"));
+        if let Some(pid) = read_lock_pid(&lock) {
+            if !process_exists(pid) {
+                let _ = std::fs::remove_file(&lock);
+            }
+        }
+    }
+}
+
+/// Remove a lock file only if it names `expected_pid` and that process is gone.
+fn remove_lock_if_owned(lock: &PathBuf, expected_pid: i32) {
+    if let Some(pid) = read_lock_pid(lock) {
+        if pid == expected_pid && !process_exists(pid) {
+            let _ = std::fs::remove_file(lock);
+        }
+    }
+}
+
+/// Read the PID an X server recorded in its lock file.
+fn read_lock_pid(lock: &PathBuf) -> Option<i32> {
+    let contents = std::fs::read_to_string(lock).ok()?;
+    contents.trim().parse::<i32>().ok()
+}
+
+/// Whether a process is still alive.
+fn process_exists(pid: i32) -> bool {
+    pid > 0 && Path::new(&format!("/proc/{pid}")).exists()
 }
 
 /// Locate an `Xvfb` binary, or report that the tests should be skipped.

@@ -23,6 +23,10 @@
 //! | 10   | `incompatible_frames`| the two frames cannot be compared              |
 //! | 11   | `comparison_failed`  | the comparison could not be performed          |
 //! | 12   | `image_load_failed`  | an input image could not be read or decoded    |
+//! | 13   | `geometry_changed`   | the observed target changed shape mid-observation |
+//! | 14   | `target_lost`        | the observed target disappeared mid-observation |
+//! | 15   | `invalid_duration`   | a duration argument was zero, negative, or unparsable |
+//! | 16   | `observation_failed` | the observation could not be performed         |
 //!
 //! ## JSON shape
 //!
@@ -57,6 +61,14 @@ pub enum Error {
     ComparisonFailed(String),
     /// An input image could not be read or decoded.
     ImageLoadFailed(String),
+    /// The observed target changed geometry during an observation.
+    GeometryChanged(String),
+    /// The observed target disappeared during an observation.
+    TargetLost(String),
+    /// A duration argument was zero, negative, or unparsable.
+    InvalidDuration(String),
+    /// The observation could not be performed.
+    ObservationFailed(String),
     /// An unexpected internal failure.
     Internal(String),
 }
@@ -110,6 +122,26 @@ impl Error {
         Error::ImageLoadFailed(message.into())
     }
 
+    /// Convenience constructor for [`Error::GeometryChanged`].
+    pub fn geometry_changed(message: impl Into<String>) -> Self {
+        Error::GeometryChanged(message.into())
+    }
+
+    /// Convenience constructor for [`Error::TargetLost`].
+    pub fn target_lost(message: impl Into<String>) -> Self {
+        Error::TargetLost(message.into())
+    }
+
+    /// Convenience constructor for [`Error::InvalidDuration`].
+    pub fn invalid_duration(message: impl Into<String>) -> Self {
+        Error::InvalidDuration(message.into())
+    }
+
+    /// Convenience constructor for [`Error::ObservationFailed`].
+    pub fn observation_failed(message: impl Into<String>) -> Self {
+        Error::ObservationFailed(message.into())
+    }
+
     /// Convenience constructor for [`Error::Internal`].
     pub fn internal(message: impl Into<String>) -> Self {
         Error::Internal(message.into())
@@ -129,6 +161,10 @@ impl Error {
             Error::IncompatibleFrames(_) => "incompatible_frames",
             Error::ComparisonFailed(_) => "comparison_failed",
             Error::ImageLoadFailed(_) => "image_load_failed",
+            Error::GeometryChanged(_) => "geometry_changed",
+            Error::TargetLost(_) => "target_lost",
+            Error::InvalidDuration(_) => "invalid_duration",
+            Error::ObservationFailed(_) => "observation_failed",
             Error::Internal(_) => "internal_error",
         }
     }
@@ -148,6 +184,10 @@ impl Error {
             Error::IncompatibleFrames(_) => 10,
             Error::ComparisonFailed(_) => 11,
             Error::ImageLoadFailed(_) => 12,
+            Error::GeometryChanged(_) => 13,
+            Error::TargetLost(_) => 14,
+            Error::InvalidDuration(_) => 15,
+            Error::ObservationFailed(_) => 16,
         }
     }
 
@@ -169,6 +209,10 @@ impl Error {
             Error::IncompatibleFrames(m) => format!("incompatible frames: {m}"),
             Error::ComparisonFailed(m) => format!("comparison failed: {m}"),
             Error::ImageLoadFailed(m) => format!("image load failed: {m}"),
+            Error::GeometryChanged(m) => format!("geometry changed: {m}"),
+            Error::TargetLost(m) => format!("target lost: {m}"),
+            Error::InvalidDuration(m) => format!("invalid duration: {m}"),
+            Error::ObservationFailed(m) => format!("observation failed: {m}"),
             Error::Internal(m) => format!("internal error: {m}"),
         }
     }
@@ -227,6 +271,14 @@ mod tests {
             ),
             (Error::ComparisonFailed("x".into()), "comparison_failed", 11),
             (Error::ImageLoadFailed("x".into()), "image_load_failed", 12),
+            (Error::GeometryChanged("x".into()), "geometry_changed", 13),
+            (Error::TargetLost("x".into()), "target_lost", 14),
+            (Error::InvalidDuration("x".into()), "invalid_duration", 15),
+            (
+                Error::ObservationFailed("x".into()),
+                "observation_failed",
+                16,
+            ),
             (Error::Internal("x".into()), "internal_error", 1),
         ];
 

@@ -4,8 +4,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use eensh::cli::{Cli, Command};
+use eensh::cli::{Cli, Command, ObservationKind};
 use eensh::error::Error;
+use eensh::observe::pipeline as observe_pipeline;
+use eensh::observe::SystemClock;
 use eensh::output::{file, MetadataDestination};
 use eensh::{diff, pipeline};
 
@@ -28,6 +30,9 @@ fn run() -> i32 {
     match cli.command {
         Command::Capture(args) => run_capture(&args),
         Command::Diff(args) => run_diff(&args),
+        Command::WaitChange(args) => run_observation(ObservationKind::WaitChange, &args),
+        Command::WaitStable(args) => run_observation(ObservationKind::WaitStable, &args),
+        Command::Observe(args) => run_observation(ObservationKind::Observe, &args),
     }
 }
 
@@ -126,3 +131,68 @@ fn run_diff(args: &eensh::cli::DiffArgs) -> i32 {
         Err(error) => report(&error, args.json),
     }
 }
+
+/// Resolve and execute one of the three temporal observation commands.
+///
+/// A timeout is not an error: the observation ran and the requested visual
+/// condition simply did not occur. It is reported in the JSON `result` and gets
+/// the dedicated timeout exit status, which is kept distinct from every error
+/// code so that a caller can tell "nothing happened" from "capture broke"
+/// without parsing anything.
+fn run_observation(kind: ObservationKind, args: &eensh::cli::ObservationArgs) -> i32 {
+    let clock = SystemClock::new();
+
+    let outcome = match kind {
+        ObservationKind::WaitChange => args.resolve_wait_change().and_then(|config| {
+            let print = config.print_timing;
+            observe_pipeline::run_wait_change(&config, &clock).map(|o| (o, print))
+        }),
+        ObservationKind::WaitStable => args.resolve_wait_stable().and_then(|config| {
+            let print = config.print_timing;
+            observe_pipeline::run_wait_stable(&config, &clock).map(|o| (o, print))
+        }),
+        ObservationKind::Observe => args.resolve_observe().and_then(|config| {
+            let print = config.print_timing;
+            observe_pipeline::run_observe(&config, &clock).map(|o| (o, print))
+        }),
+    };
+
+    match outcome {
+        Ok((outcome, print_timing)) => {
+            if !args.json {
+                // resolve_output requires --json, so this is unreachable in
+                // practice; kept so the branch is explicit rather than silent.
+                file::write_stderr(&format!("{}", outcome.response.observation.result));
+            }
+
+            if print_timing {
+                let timing = &outcome.response.timing;
+                let observation = &outcome.response.observation;
+                file::write_stderr(&format!(
+                    "eensh {} timing: elapsed={}ms captures={} comparisons={} capture={}us compare={}us sleep={}us encode={}us",
+                    kind,
+                    observation.elapsed_ms,
+                    timing.captures,
+                    timing.comparisons,
+                    timing.capture_us_total,
+                    timing.compare_us_total,
+                    timing.sleep_us_total,
+                    timing.encode.encode_us,
+                ));
+            }
+
+            match outcome.response.observation.result {
+                eensh::observe::Outcome::Timeout => EXIT_TIMEOUT,
+                _ => 0,
+            }
+        }
+        Err(error) => report(&error, args.json),
+    }
+}
+
+/// Exit status for a timeout.
+///
+/// Distinct from every error code (1-16) so that an agent can distinguish
+/// "the condition did not occur" from "something failed". The JSON `result`
+/// field remains the authoritative statement.
+const EXIT_TIMEOUT: i32 = 100;

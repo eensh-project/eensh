@@ -18,10 +18,12 @@
 
 use crate::capture::{x11, CaptureRequest, Display};
 use crate::cli::{ResizeRequest, ResolvedCapture};
-use crate::encode::{self, EncodeOptions};
+use crate::encode::{self, EncodeOptions, EncodedImage, ImageFormat, PngEffort};
 use crate::error::Error;
 use crate::frame::Frame;
-use crate::geometry::{resize_by_scale, resize_to_height, resize_to_width, Rect, Transform};
+use crate::geometry::{
+    resize_by_scale, resize_to_height, resize_to_width, Rect, SourceGeometry, Transform,
+};
 use crate::output::{base64, json::CaptureResponse};
 use crate::resize;
 use crate::timing::{Stopwatch, TimingBuilder};
@@ -39,6 +41,126 @@ pub struct CaptureOutcome {
     pub metadata_written: bool,
 }
 
+/// How a returned frame should be resized and encoded.
+///
+/// Extracted so that `capture` and the Phase 3 observation commands share one
+/// presentation path. Observation must not invent a second way to encode a
+/// frame: it uses this, on the single frame the operation ends on.
+///
+/// Not `Eq`, because [`ResizeRequest::Scale`] carries an `f64`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImageOptions {
+    /// Requested resize.
+    pub resize: ResizeRequest,
+    /// Output format.
+    pub format: ImageFormat,
+    /// JPEG quality.
+    pub quality: u8,
+    /// PNG compression effort.
+    pub png_effort: PngEffort,
+    /// Whether to embed the image as base64 in the JSON response.
+    pub base64: bool,
+}
+
+impl ImageOptions {
+    /// Take the image settings from a resolved capture.
+    pub fn from_capture(config: &ResolvedCapture) -> Self {
+        ImageOptions {
+            resize: config.resize,
+            format: config.format,
+            quality: config.quality,
+            png_effort: config.png_effort,
+            base64: config.base64,
+        }
+    }
+}
+
+/// A frame that has been resized, encoded, and optionally base64 encoded.
+///
+/// The native source geometry is carried separately from the encoded image,
+/// because a resize means those are two different coordinate spaces and the
+/// response must not conflate them.
+#[derive(Debug)]
+pub struct PreparedImage {
+    /// Where the frame came from, in native source pixels.
+    pub source_geometry: SourceGeometry,
+    /// The encoded image.
+    pub encoded: EncodedImage,
+    /// Base64 of the encoded bytes, when requested.
+    pub data: Option<String>,
+    /// Image-to-source coordinate mapping.
+    pub transform: Transform,
+    /// Resize duration in microseconds.
+    pub resize_us: u64,
+    /// Encode duration in microseconds.
+    pub encode_us: u64,
+    /// Base64 duration in microseconds.
+    pub base64_us: u64,
+}
+
+impl PreparedImage {
+    /// JPEG quality to report, when the image is a JPEG.
+    pub fn quality(&self, options: &ImageOptions) -> Option<u8> {
+        match options.format {
+            ImageFormat::Jpeg => Some(options.quality),
+            ImageFormat::Png => None,
+        }
+    }
+}
+
+/// Resize, encode, and optionally base64 encode a frame.
+///
+/// This is the whole presentation path for a returned frame, and it runs exactly
+/// once per operation — for a capture, on the captured frame; for an observation,
+/// on the settled frame. Sampled frames during an observation are never encoded.
+pub fn prepare_image(frame: Frame, options: &ImageOptions) -> Result<PreparedImage, Error> {
+    // Resize is applied to raw pixels, before encoding.
+    let mut stopwatch = Stopwatch::start();
+    let frame = apply_resize(frame, options.resize)?;
+    let resize_us = stopwatch.stop();
+
+    let image_rect = Rect::new(
+        frame.source_geometry.x,
+        frame.source_geometry.y,
+        frame.source_geometry.width,
+        frame.source_geometry.height,
+    )?;
+
+    let mut stopwatch = Stopwatch::start();
+    let encoded = encode::encode(
+        &frame,
+        &EncodeOptions {
+            format: options.format,
+            quality: options.quality,
+            png_effort: options.png_effort,
+        },
+    )?;
+    let encode_us = stopwatch.stop();
+
+    let mut stopwatch = Stopwatch::start();
+    let data = if options.base64 {
+        Some(base64::encode(&encoded.bytes))
+    } else {
+        None
+    };
+    let base64_us = stopwatch.stop();
+
+    // The transform maps image pixels back to source pixels, and is derived from
+    // the *native source* rectangle and the *encoded* size. Deriving it from the
+    // resized frame instead would quietly claim a source size that never existed.
+    let transform = Transform::new(&image_rect, encoded.width, encoded.height)?;
+
+    Ok(PreparedImage {
+        source_geometry: frame.source_geometry,
+        encoded,
+        data,
+        transform,
+        resize_us,
+        encode_us,
+        base64_us,
+    })
+}
+
 /// Run a fully resolved capture.
 ///
 /// The returned outcome reports what was written where, so the CLI can decide
@@ -52,63 +174,30 @@ pub fn run(config: &ResolvedCapture) -> Result<CaptureOutcome, Error> {
     let frame = capture_frame(config)?;
     timing.capture(&mut stopwatch);
 
-    // Stage 2: resize, on raw pixels.
-    let mut stopwatch = Stopwatch::start();
-    let frame = apply_resize(frame, config.resize)?;
-    timing.resize(&mut stopwatch);
-
-    let image_rect = Rect::new(
-        frame.source_geometry.x,
-        frame.source_geometry.y,
-        frame.source_geometry.width,
-        frame.source_geometry.height,
-    )?;
-
-    // Stage 3: encode.
-    let mut stopwatch = Stopwatch::start();
-    let options = EncodeOptions {
-        format: config.format,
-        quality: config.quality,
-        png_effort: config.png_effort,
-    };
-    let encoded = encode::encode(&frame, &options)?;
-    timing.encode(&mut stopwatch);
-
-    // Stage 4: base64, applied only to the encoded bytes.
-    let mut stopwatch = Stopwatch::start();
-    let data = if config.base64 {
-        Some(base64::encode(&encoded.bytes))
-    } else {
-        None
-    };
-    timing.base64(&mut stopwatch);
+    // Stages 2-4: resize, encode, and base64, shared with observation.
+    let options = ImageOptions::from_capture(config);
+    let prepared = prepare_image(frame, &options)?;
+    timing.record(&prepared);
 
     let timing = timing.finish();
-
-    // The transform maps image pixels back to source pixels, and is derived
-    // from the *source* rectangle and the *encoded* size. Deriving it from the
-    // resized frame instead would quietly claim a source size that never
-    // existed.
-    let transform = Transform::new(&image_rect, encoded.width, encoded.height)?;
-
-    let quality = match config.format {
-        encode::ImageFormat::Jpeg => Some(config.quality),
-        encode::ImageFormat::Png => None,
-    };
+    let quality = prepared.quality(&options);
 
     let response = CaptureResponse::new(
-        frame.source_geometry.clone(),
-        &encoded,
-        transform,
+        prepared.source_geometry.clone(),
+        &prepared.encoded,
+        prepared.transform,
         timing,
-        data,
+        prepared.data.clone(),
         quality,
     );
 
     // Stage 5: output.
     let mut image_written = false;
     if config.output.write_image_bytes {
-        config.output.destination.write_image(&encoded.bytes)?;
+        config
+            .output
+            .destination
+            .write_image(&prepared.encoded.bytes)?;
         image_written = true;
     }
 
@@ -124,7 +213,7 @@ pub fn run(config: &ResolvedCapture) -> Result<CaptureOutcome, Error> {
 
     Ok(CaptureOutcome {
         response,
-        encoded: encoded.bytes,
+        encoded: prepared.encoded.bytes,
         image_written,
         metadata_written,
     })
@@ -144,7 +233,7 @@ fn capture_frame(config: &ResolvedCapture) -> Result<Frame, Error> {
 }
 
 /// Apply the requested resize to a raw frame.
-fn apply_resize(frame: Frame, request: ResizeRequest) -> Result<Frame, Error> {
+pub fn apply_resize(frame: Frame, request: ResizeRequest) -> Result<Frame, Error> {
     let (width, height) = match request {
         ResizeRequest::None => return Ok(frame),
         ResizeRequest::Width(target) => {

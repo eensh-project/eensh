@@ -124,6 +124,52 @@ pub enum Request {
         /// How to present the final frame.
         output: ImageOptionsWire,
     },
+
+    /// Capture a bounded real-time temporal stack from a session.
+    ///
+    /// Distinct from [`Request::SessionObserve`] in the same way the two operations
+    /// are: an observation waits for a condition, a real-time sample does not wait for
+    /// anything. It samples the current visual state over a short interval and
+    /// returns what it captured.
+    SessionRealtime {
+        /// The session to sample.
+        session_id: String,
+        /// How many frames, how far apart, and by when.
+        realtime: RealtimeWire,
+        /// How to present every returned frame.
+        output: ImageOptionsWire,
+    },
+}
+
+/// Real-time sampling parameters over the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealtimeWire {
+    /// How many physical frames to capture, 1..=[`crate::realtime::MAX_FRAMES`].
+    pub frames: usize,
+    /// The cadence between scheduled sample opportunities.
+    pub interval_ms: u64,
+    /// The deadline after which no new capture is started.
+    pub timeout_ms: u64,
+}
+
+impl From<RealtimeWire> for crate::realtime::RealtimeOptions {
+    fn from(wire: RealtimeWire) -> Self {
+        crate::realtime::RealtimeOptions {
+            frames: wire.frames,
+            interval: std::time::Duration::from_millis(wire.interval_ms),
+            timeout: std::time::Duration::from_millis(wire.timeout_ms),
+        }
+    }
+}
+
+impl From<crate::realtime::RealtimeOptions> for RealtimeWire {
+    fn from(options: crate::realtime::RealtimeOptions) -> Self {
+        RealtimeWire {
+            frames: options.frames,
+            interval_ms: options.interval.as_millis() as u64,
+            timeout_ms: options.timeout.as_millis() as u64,
+        }
+    }
 }
 
 /// The target part of a session-create request.
@@ -486,6 +532,11 @@ pub enum ResponseBody {
         /// The observation result.
         observation: crate::output::json::ObservationResponse,
     },
+    /// Answer to [`Request::SessionRealtime`].
+    Realtime {
+        /// The temporal stack and its timing.
+        realtime: crate::session::realtime::RealtimeResponse,
+    },
 }
 
 /// Write a length-delimited JSON frame.
@@ -653,7 +704,8 @@ impl Request {
             | Request::SessionLatest { session_id, .. }
             | Request::SessionFrame { session_id, .. }
             | Request::SessionDiff { session_id, .. }
-            | Request::SessionObserve { session_id, .. } => Some(session_id),
+            | Request::SessionObserve { session_id, .. }
+            | Request::SessionRealtime { session_id, .. } => Some(session_id),
         }
     }
 
@@ -670,6 +722,7 @@ impl Request {
             Request::SessionFrame { .. } => "session_frame",
             Request::SessionDiff { .. } => "session_diff",
             Request::SessionObserve { .. } => "session_observe",
+            Request::SessionRealtime { .. } => "session_realtime",
         }
     }
 }

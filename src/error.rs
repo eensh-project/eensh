@@ -206,6 +206,54 @@ impl Error {
         Error::ServiceOverloaded(message.into())
     }
 
+    /// Rebuild an error from a service's error code.
+    ///
+    /// A client receives a stable code and a human message across the socket. The
+    /// code is the contract, so it is mapped back to the variant it names — which
+    /// means a client can branch on `err.code()` exactly as it would in-process, and
+    /// a `session_busy` from the service is still recognisably a `session_busy`.
+    ///
+    /// An unrecognised code becomes a protocol error carrying the original code in
+    /// its message, rather than being silently coerced to something it is not. A
+    /// client built against a newer service should be told it does not understand the
+    /// answer.
+    pub fn from_service_code(code: &str, message: &str) -> Self {
+        match code {
+            "invalid_arguments" => Error::InvalidArguments(message.to_string()),
+            "display_unavailable" => Error::DisplayUnavailable {
+                display: String::new(),
+                detail: message.to_string(),
+            },
+            "invalid_region" => Error::InvalidRegion(message.to_string()),
+            "window_not_found" => Error::WindowNotFound {
+                window_id: message.to_string(),
+            },
+            "capture_failed" => Error::CaptureFailed(message.to_string()),
+            "resize_failed" => Error::ResizeFailed(message.to_string()),
+            "encode_failed" => Error::EncodeFailed(message.to_string()),
+            "output_failed" => Error::OutputFailed(message.to_string()),
+            "incompatible_frames" => Error::IncompatibleFrames(message.to_string()),
+            "comparison_failed" => Error::ComparisonFailed(message.to_string()),
+            "image_load_failed" => Error::ImageLoadFailed(message.to_string()),
+            "geometry_changed" => Error::GeometryChanged(message.to_string()),
+            "target_lost" => Error::TargetLost(message.to_string()),
+            "invalid_duration" => Error::InvalidDuration(message.to_string()),
+            "observation_failed" => Error::ObservationFailed(message.to_string()),
+            "session_not_found" => Error::SessionNotFound(message.to_string()),
+            "session_busy" => Error::SessionBusy(message.to_string()),
+            "session_closed" => Error::SessionClosed(message.to_string()),
+            "frame_not_available" => Error::FrameNotAvailable(message.to_string()),
+            "no_frame_available" => Error::NoFrameAvailable(message.to_string()),
+            "service_unavailable" => Error::ServiceUnavailable(message.to_string()),
+            "service_overloaded" => Error::ServiceOverloaded(message.to_string()),
+            "service_protocol_error" => Error::ServiceProtocolError(message.to_string()),
+            other => Error::service_protocol_error(format!(
+                "the service reported {other:?}, which this client does not recognise: \
+                 {message}"
+            )),
+        }
+    }
+
     /// Whether this error means the request should not be retried against the
     /// same session.
     ///

@@ -21,6 +21,7 @@ use crate::session::manager::SessionManager;
 use crate::session::pipeline::{
     self as session_pipeline, FrameRequest, ServiceStatus, SessionDiffResponse,
 };
+use crate::session::realtime as session_realtime;
 use crate::timing::Stopwatch;
 
 /// The service's request handler.
@@ -244,6 +245,29 @@ impl Handler {
                 Ok(ResponseBody::Observation {
                     observation: outcome.response,
                 })
+            }
+
+            Request::SessionRealtime {
+                session_id,
+                realtime,
+                output,
+            } => {
+                // `try_get` for the same reason as an observation: `realtime` is a
+                // temporal operation, and only one may run per session. A queued
+                // real-time observation would be stale before it started, so it is
+                // refused promptly instead.
+                let handle = self.manager.try_get(&session_id)?;
+                let options = output.to_image_options()?;
+                let clock = SystemClock::new();
+
+                // Sampling first, entirely, and only then presentation. Nothing is
+                // encoded inside the sampling window, because that would stretch the
+                // interval the caller asked for.
+                let capture =
+                    session_realtime::session_realtime(&handle, &realtime.into(), &clock)?;
+                let response = capture.prepare(&options)?;
+
+                Ok(ResponseBody::Realtime { realtime: response })
             }
         }
     }

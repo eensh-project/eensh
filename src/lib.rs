@@ -82,6 +82,7 @@
 
 pub mod capture;
 pub mod cli;
+pub mod client;
 pub mod compare;
 pub mod diff;
 pub mod encode;
@@ -92,6 +93,7 @@ pub mod input;
 pub mod observe;
 pub mod output;
 pub mod pipeline;
+pub mod realtime;
 pub mod resize;
 pub mod service;
 pub mod session;

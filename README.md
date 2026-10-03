@@ -8,9 +8,10 @@ returns an image that an agent can consume directly: PNG or JPEG bytes, an
 optional base64 payload, and a stable JSON document that states exactly where the
 pixels came from, how big the returned image is, and how to map image coordinates
 back to screen coordinates. It compares two frames to say precisely what changed
-and where. And it watches a target over time, so an agent can replace
+and where. It watches a target over time, so an agent can replace
 `sleep(arbitrary)` with "wait until the screen settles and tell me what it looks
-like".
+like". And it samples a short temporal stack, so an agent can tell *motion* from
+*stillness* rather than inferring it from two frames an unknown distance apart.
 
 It is designed to replace `scrot`-style capture in agent tooling, especially on
 Xvfb-backed desktops, without the usual ambiguity about coordinates — or about
@@ -42,7 +43,7 @@ eensh capture \
 
 ## Why another screenshot tool?
 
-Four things are unusually painful when a *program* takes screenshots:
+Five things are unusually painful when a *program* takes screenshots:
 
 1. **Coordinate ambiguity.** A resized screenshot has two different widths: the
    screen's and the image's. Tools tend to report one and leave the caller to
@@ -58,6 +59,10 @@ Four things are unusually painful when a *program* takes screenshots:
 4. **Timing.** `sleep(2)` and hope is the standard way to wait for a UI, and it is
    wrong in both directions. `eensh observe` waits for the transition and then for
    the result to stop moving, and reports how long that took.
+5. **One frame cannot show motion.** Three frames a tenth of a second apart, each
+   labelled with when it was taken, answer "is this still moving" directly.
+   `eensh session realtime` returns that stack rather than leaving the caller to
+   make several calls and reassemble the timing itself.
 
 ## Installation
 
@@ -90,7 +95,8 @@ eensh observe     [TARGET OPTIONS] [IMAGE OPTIONS] [OBSERVATION OPTIONS]
 eensh serve       [--socket PATH]
 eensh ping        [--socket PATH] [--json]
 eensh session     create|list|info|close|capture|latest|frame|diff
-                  wait-change|wait-stable|observe   [--socket PATH] [--json]
+                  wait-change|wait-stable|observe|realtime
+                  [--socket PATH] [--json]
 ```
 
 The five standalone commands each open a display, do their work, and exit. The
@@ -896,6 +902,294 @@ own its pixels; a reused buffer would be overwritten by the next capture while
 history still referred to it. The Phase 4 saving is connection reuse, and the
 allocation saved is the per-capture connection state rather than the pixel buffer.
 
+## Real-time observation
+
+A single frame is one moment. Often that is not enough: to tell whether something
+is *moving*, whether a spinner is still spinning, or whether a page is still
+settling, you need several moments and you need to know how far apart they are.
+
+```bash
+eensh session realtime <SESSION_ID> [--frames N] [--interval D] [--timeout D]
+                       [--width W] [--format png|jpeg] [--base64]
+```
+
+`session realtime` takes a bounded temporal stack: a small number of fresh frames
+across a short window, returned oldest first, each carrying the moment it was
+taken.
+
+```bash
+eensh session create --display :99 --json          # -> session_id
+eensh session realtime s123 --frames 3 --base64 --json
+```
+
+The difference between `realtime` and `observe` is worth stating plainly.
+`observe` answers *did it change, and when did it settle* and returns only the
+final frame: it is a state machine that consumes frames to reach a verdict.
+`realtime` answers *what did it look like along the way* and returns every frame:
+it is a sampling operation that keeps what it took.
+
+### Options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--frames N` | 3 | How many frames, 1–8. A **maximum**, not a promise |
+| `--interval D` | 50 ms | Nominal spacing between sample opportunities |
+| `--timeout D` | 500 ms | Deadline for *starting* a capture |
+| `--width W`, `--height`, `--scale` | — | Resize each returned image; applied after sampling |
+| `--format`, `--quality`, `--compression` | png | Encoding for each returned frame |
+| `--base64` | off | Embed each image inline |
+
+The defaults are deliberately not the defaults of `observe` (which uses a 100 ms
+interval and a 5 s timeout). `observe` is patient because it is waiting for
+something to happen. `realtime` is bounded because the caller asked for a short
+window, and a 5-second default would silently turn a quick look into a stall.
+
+### The sampling schedule
+
+Sample *opportunities* are scheduled against a fixed origin: exact multiples of
+the interval measured from the start of the request. They are not scheduled from
+the end of the previous capture.
+
+```text
+0ms      50ms     100ms    150ms    200ms
+ |        |        |        |        |
+ +--------+--------+--------+--------+
+ sample   sample   sample   sample   sample
+```
+
+This is the difference between a cadence and a chain. If a capture at 50 ms takes
+30 ms, the next opportunity is still at 100 ms — 20 ms away, not 50 ms away — so a
+slow capture cannot push the whole schedule later.
+
+An opportunity that cannot be taken is **skipped, never replayed.** If the capture
+at 50 ms were still running at 100 ms, that slot is gone: the next sample is taken
+at the next opportunity that is reachable. Replaying missed slots would quietly
+double the length of the window and destroy the property the caller actually asked
+for, which is that the frames are spaced by roughly the interval.
+
+`skipped_opportunities` counts exactly this. A large number is not an error; it
+means the cadence was optimistic for the machine and the stack is more tightly
+spaced in real time than the nominal schedule suggests.
+
+### Partial results
+
+A request can be *accepted* and still not fit in its deadline. `--frames 8
+--interval 1s --timeout 250ms` is a reasonable thing to type by mistake, and the
+answer is a partial stack rather than an error:
+
+```json
+{
+  "realtime": {
+    "result": "partial",
+    "requested_frames": 8,
+    "captured_frames": 1,
+    "skipped_opportunities": 0,
+    "elapsed_ms": 0
+  }
+}
+```
+
+The frames that were obtained are returned, complete. Discarding work that was
+already done would be worse than reporting it, and the caller can see from
+`result` that the stack is short. Exit status is 0: a partial stack is a result,
+not a failure.
+
+The timeout gates **starting** a capture, not finishing one. A capture that began
+before the deadline is allowed to complete, so `elapsed_ms` can exceed the timeout
+by up to one capture duration. Abandoning a capture mid-flight would produce a
+torn frame for no benefit.
+
+### Frame ages
+
+Every frame carries three times:
+
+| Field | Meaning |
+|---|---|
+| `capture_offset_us` | When the sample was taken, measured from the start of the request |
+| `capture_duration_us` | How long the capture itself took |
+| `age_us` | How long ago the frame was captured, when the response was assembled |
+
+`age_us` is the honest one for deciding whether a frame is worth acting on. The
+newest frame is already an age by the time a caller sees it — in the default
+configuration, comfortably over 100 ms, because three PNG encodes happen before
+the response is sent:
+
+```text
+newest age:      mean 104.8ms  p95 107.0ms
+```
+
+Ages are computed *after* every encode, so they describe the moment the response
+is finished rather than a moment that the encoding has since aged. `newest_frame_id`
+and `newest_frame_age_us` are also hoisted to the top of the response, so the
+common question — *how stale is the freshest thing here* — needs no array walk.
+
+### Encoding does not happen between samples
+
+This is the property that makes the timings mean anything, and it is enforced by
+the shape of the code rather than by a rule someone remembered to follow.
+
+The sampling loop consumes only raw frames:
+
+```rust
+pub trait RealtimeSource {
+    fn capture(&mut self) -> Result<SessionFrame, Error>;
+}
+
+pub fn sample_stack<S: RealtimeSource>(...) -> Result<RealtimeResult, Error>
+```
+
+`RealtimeResult` has no image field and no encoder in scope. All resizing,
+encoding, and base64 happen afterwards, in a separate `prepare` pass over the
+already-collected stack. Encoding inside the window would stretch the interval the
+caller asked for, and the offsets would then describe the encoder as much as the
+scene.
+
+The timing block reports the two phases separately, so the claim is checkable
+rather than merely asserted:
+
+```text
+sampling window:  208382us        <- contains no encoding
+  capture:         25710us
+  sleep:          182663us
+  unaccounted:         9us
+presentation:                     <- happens after sampling ends
+  encode:         104155us
+  base64:             43us
+```
+
+Capture plus sleep account for the window to within microseconds. The three PNG
+encodes cost about 104 ms and are reported outside it entirely. That gap is also
+why `age_us` is not near zero: it is the encoding time that elapsed after the last
+sample was taken.
+
+### Stack ordering and identity
+
+Frames are returned **oldest first**, and `capture_offset_us` increases
+monotonically. Each frame carries the ordinary session `frame_id`, which means:
+
+- A stack can be interleaved with independent captures — the identifiers will not
+  be contiguous, and the ordering is by offset rather than by identifier.
+- Every sampled frame is retrievable afterwards by `session frame <ID>`, exactly
+  like any other frame.
+
+Every sample enters history (requirement 54), but the returned stack does **not**
+depend on history being able to hold it. The operation owns its frames for its own
+lifetime, so `--frames 8` against a session with `--history 2` still returns eight
+frames; the six that were evicted are simply no longer retrievable afterwards. A
+request for an evicted frame is `frame_not_available` (exit 20) rather than a
+silent substitution of a different frame.
+
+### Backpressure
+
+Only **one temporal operation may run per session.** A second one is refused
+immediately with `session_busy` (exit 18), in either direction, and the same rule
+covers `observe`, `wait-change`, and `wait-stable`:
+
+```bash
+eensh session realtime s123 &                  # takes the slot
+eensh session wait-change s123 --timeout 1s    # -> exit 18, session_busy
+```
+
+A queued real-time observation would be stale before it even started, so it is
+refused rather than parked. The refusal is immediate — no waiting on a lock — and
+it leaves the session untouched, so a retry later sees a clean session.
+
+A one-shot `capture` is treated differently: it is **serialized, not refused.**
+`capture` is a request for a frame *now*, and serving it at the next sample
+boundary is both possible and useful, so an orchestrator can keep using the
+session while a stack is being taken.
+
+Different sessions never contend. There is no global lock, so real-time sampling
+in one session leaves another completely free — including another real-time stack.
+
+### Long-lived clients
+
+Spawning a process per observation is wasteful for an agent that observes
+repeatedly, and it makes the connection bound hard to reason about. `eensh::client`
+exposes the protocol directly over one reusable connection:
+
+```rust
+use eensh::client::{EenshClient, ImageSpec, SessionSpec};
+use eensh::realtime::RealtimeOptions;
+
+let mut client = EenshClient::connect_default()?;
+let session = client.create_session(":99", &SessionSpec::desktop().with_history(4))?;
+
+let stack = client.realtime(session.id(), &RealtimeOptions::default(), ImageSpec::metadata_only())?;
+println!("{} frames, newest {} µs old", stack.captured_frames(), stack.newest_frame_age_us());
+```
+
+Every method takes `&mut self`, which enforces one outstanding request per
+connection at the type level rather than by convention. The client is the same
+protocol the CLI speaks, so a caller can mix the two freely, and every session
+command has a corresponding method.
+
+Two consequences of reuse are worth knowing. Request identifiers are unique per
+connection and every response echoes the one it answers, so a mismatched reply is
+an error rather than a confusing success. And a malformed request does not end the
+connection: the service answers with a structured error and continues, so one bad
+call does not cost the caller its connection.
+
+The service bounds simultaneous connections (64 by default) and answers beyond the
+bound with `service_overloaded` (exit 24). That is a deliberate limit rather than
+an unbounded thread spawn, and the error is explicit so a caller can retry or fall
+back to sharing a connection.
+
+### Cost
+
+Measured over 12 operations at 640×480, with presentation held identical on every
+path (PNG at 160 px wide, inline) so the comparison is of transport rather than of
+codec:
+
+| Path | Mean | Per frame |
+|---|---|---|
+| Standalone (`capture` with a process and connection per frame) | 23.8 ms | 23.8 ms |
+| Session CLI (one session, a process per frame) | 22.3 ms | 22.3 ms |
+| Direct client (one connection, no process per frame) | 19.3 ms | 19.3 ms |
+| Direct client, real-time stack of 3 at 50 ms | 142.6 ms | 47.5 ms |
+
+The per-frame number for a stack is *higher* than a single capture, and that is the
+whole point: a stack of three frames spaced 50 ms apart cannot finish before
+100 ms, because waiting is the feature. Three separate captures return sooner — and
+show three nearly identical moments. The cost shape is a schedule, not a
+throughput figure: at 50 ms cadence the stack is dominated by sleep (183 ms of a
+208 ms window), so a machine of half the speed would barely change it.
+
+Sampling measurements for two cadences, over 8 runs each:
+
+| Cadence | Complete | Skipped slots | Round trip | Newest age |
+|---|---|---|---|---|
+| 3 frames @ 50 ms | 8/8 | 0 | 214 ms | 105 ms |
+| 4 frames @ 25 ms | 8/8 | 0 | 223 ms | 140 ms |
+
+Sample durations are steady on this machine (~7.5 ms for a 640×480 frame), so both
+cadences complete. Under a cadence faster than capture — 5 frames at 1 ms — the
+schedule degrades exactly as designed: 77 opportunities skipped, all 5 frames still
+captured, and the whole thing finished in well under a second because the missing
+slots were never replayed.
+
+Memory is bounded by history, not by the size of a stack:
+
+| Configuration | Stack | History | Retained |
+|---|---|---|---|
+| 8 frames, `--history 4`, 640×480 | 8 frames | 4 frames | 3,686,400 B |
+
+A raw frame is three bytes per pixel, so 640×480 is 921,600 B and the retained
+total is exactly four of them. The stack's other four frames are released when the
+operation ends. Two concurrent six-frame stacks in separate sessions hold their own
+frames independently (5,529,600 B each) and neither is left unusable afterwards.
+
+**No capture buffers are reused here either**, for the same reason as Phase 4: a
+frame that is retained, or that belongs to a returned stack, must own its pixels.
+
+### No new exit codes
+
+Real-time observation reuses the existing table: `session_busy` (18),
+`session_closed` (19), `frame_not_available` (20), `target_lost` (14),
+`observation_failed` (16), and 100 for a timeout. A destroyed window mid-sampling
+is terminal and marks the session failed, exactly as it does for `observe`. A
+partial stack is exit 0.
+
 ## Testing
 
 ```bash
@@ -968,25 +1262,56 @@ The suite covers, among other things:
   latency with mean/p50/p95 and totals, the ordering of retrieval, comparison, and
   capture cost, history bounded by capacity with retained bytes equal to retained
   frames times the frame size, retained bytes unchanged by repeated retrievals, and
-  the IPC round trip measured in isolation.
+  the IPC round trip measured in isolation;
+* **real-time sampling (Phase 5), synthetic**: the schedule as a pure function —
+  exact sample offsets at a fixed origin, skips never replayed, a capture that
+  overruns its slot, a cadence faster than capture, the timeout gating the *start*
+  of a capture, a partial stack under an impossible deadline, a single-frame stack,
+  option validation at both bounds, and the ordering and identity rules;
+* **real-time sampling over Xvfb**: a moving scene captured in temporal order, a
+  static scene still yielding every requested frame, every sample entering history
+  and remaining retrievable, resizing applied only after sampling, an interleaved
+  external capture leaving the stack intact, a stack larger than history returned
+  whole, a destroyed target reported as `target_lost` and failing the session, and
+  base64 payloads each decoding as a standalone image;
+* **real-time backpressure**: a second real-time request refused with
+  `session_busy` rather than queued, the same refusal for `wait-change`,
+  `wait-stable`, and `observe` in both directions, a one-shot capture during a
+  stack *served* rather than refused, real-time sampling in one session not
+  blocking another, and a partial stack leaving the session usable;
+* **real-time cost and memory**: the four paths to a frame compared with
+  presentation held identical, sampling and encode phases measured separately and
+  shown not to overlap, skip counts under an optimistic cadence, retained bytes
+  bounded by history rather than by stack size, and two concurrent stacks holding
+  independent frames;
+* **long-lived clients**: a whole sequence of operations over one connection, many
+  sequential requests without degradation, retrieval after a stack over the same
+  connection, a malformed request leaving the connection usable, close leaving the
+  connection reusable, a clear error once the service stops, the simultaneous
+  connection bound with `service_overloaded` beyond it, unique request IDs echoed
+  per response, and a client per concurrent caller.
 
-The integration tests in `tests/observe_equivalence.rs` and
-`tests/session_concurrency.rs` hold a connection open for a whole scenario,
-because Xvfb resets the root window when its last client disconnects. Without that
-keep-alive a replayed scene would start from a cleared screen, which is subtle
-enough that it silently produced a wrong answer during development.
+The integration tests in `tests/observe_equivalence.rs`, `tests/session_concurrency.rs`,
+and `tests/realtime_x11.rs` hold a connection open for a whole scenario, because Xvfb
+resets the root window when its last client disconnects. Without that keep-alive a
+replayed scene would start from a cleared screen, which is subtle enough that it
+silently produced a wrong answer during development. The tests that sample the root
+window while nothing is being painted keep a connection open explicitly for the same
+reason.
 
 Metrics are printed rather than asserted, because there is no defensible universal
 threshold to assert against. Run them with:
 
 ```bash
 cargo test --offline --test persistence_metrics -- --nocapture --test-threads=1
+cargo test --offline --test realtime_metrics -- --nocapture --test-threads=1
 ```
 
 What those tests *do* assert is the structural claim — that the persistent path
-really does avoid repeating connection setup, and that history really is bounded —
-because those are properties of this implementation rather than of the machine it
-runs on.
+really does avoid repeating connection setup, that history really is bounded, that
+encoding really does not occur inside a sampling window, and that skipped
+opportunities really are never replayed — because those are properties of this
+implementation rather than of the machine it runs on.
 
 Integration tests start their own `Xvfb` and draw known colours onto it, then
 verify the captured pixels at the coordinates they were drawn at. That is what
@@ -1011,16 +1336,25 @@ Implemented:
   frame history, retrieval and comparison of retained frames without touching
   the display, observation inside a session using the unchanged Phase 3 state
   machines, and a `eensh session` client.
+* **Phase 5** — real-time observation: `session realtime` for a bounded temporal
+  stack of 1–8 fresh frames at a fixed-origin cadence, with explicit sampling
+  timing, skipped-opportunity accounting, partial results under a short deadline,
+  per-frame ages, and a reusable long-lived client (`eensh::client`) over one
+  connection, plus a bound on simultaneous service connections.
 
 Deliberately **not** implemented, and reserved for later phases: ignore masks,
 named regions, connected-component segmentation, tile summaries, perceptual
 hashes, optical flow, adaptive payload selection, multi-region observation, a
 network service, input injection, and Wayland support. Also deliberately deferred:
-XDamage (Phase 4 still polls, per the Phase 3 cadence) and MIT-SHM (capture goes
-through the ordinary X11 path). Disk persistence of frames: history lives in
-memory and is deliberately not written anywhere. See `specs/` for the roadmap.
+XDamage (both Phase 4 and Phase 5 still poll, per the Phase 3 cadence) and MIT-SHM
+(capture goes through the ordinary X11 path). There is no push notification: a
+caller asks for a stack and waits, rather than subscribing to a stream. Disk
+persistence of frames: history lives in memory and is deliberately not written
+anywhere. See `specs/` for the roadmap.
 
 The one thing Phase 3 is *bad* at is per-sample connection cost: every sample opens
 its own X11 connection. Phase 4 amortises that, without changing any of the
 semantics above — which is exactly what the equivalence tests are there to
-establish.
+establish. Phase 5 does not change the sampling semantics either: it composes the
+Phase 3 `Clock`, the Phase 1 image preparation, and the Phase 4 session history,
+and adds only the schedule.

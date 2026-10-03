@@ -244,6 +244,12 @@ fn build_request(command: &SessionCommand) -> Result<RequestEnvelope, Error> {
             stable_for_ms: args.stable_for(ObservationKind::Observe).as_millis() as u64,
             output: to_wire(&args.image, args.base64)?,
         },
+
+        SessionCommand::Realtime(args) => Request::SessionRealtime {
+            session_id: args.session_id.clone(),
+            realtime: args.options()?.into(),
+            output: to_wire(&args.image, args.base64)?,
+        },
     };
 
     Ok(RequestEnvelope::new(request_id(), request))
@@ -459,6 +465,20 @@ fn summarize(result: &ResponseBody) -> String {
             format!(
                 "{} {}: {} captures in {}ms,{}",
                 section.kind, section.result, section.captures, section.elapsed_ms, frames
+            )
+        }
+        ResponseBody::Realtime { realtime } => {
+            let summary = &realtime.realtime;
+            format!(
+                "realtime {}: {}/{} frames, {} skipped, {}ms sampling, {} frames {}x{}",
+                summary.result,
+                summary.captured_frames,
+                summary.requested_frames,
+                summary.skipped_opportunities,
+                summary.elapsed_ms,
+                realtime.frames.len(),
+                realtime.source.width,
+                realtime.source.height
             )
         }
     }

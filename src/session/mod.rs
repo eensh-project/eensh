@@ -35,6 +35,7 @@
 pub mod history;
 pub mod manager;
 pub mod pipeline;
+pub mod realtime;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

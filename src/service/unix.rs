@@ -28,7 +28,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::error::Error;
@@ -80,12 +80,25 @@ pub fn socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("eensh-{uid}.sock"))
 }
 
+/// The default maximum number of simultaneous client connections.
+///
+/// Phase 4 spawned an unbounded thread per connection, which means a client that
+/// opened connections in a loop could make the service spawn threads without limit.
+/// The bound exists for resource bounding rather than load balancing: exceeding it is
+/// answered with an explicit `service_overloaded` error, so a caller learns that the
+/// service is busy instead of watching its connection silently hang.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
+
 /// A running service.
 pub struct Service {
     listener: UnixListener,
     socket: PathBuf,
     handler: Arc<Handler>,
     shutdown: Arc<AtomicBool>,
+    /// Simultaneous client connections currently being served.
+    connections: Arc<AtomicUsize>,
+    /// The maximum allowed, checked before spawning a handler thread.
+    max_connections: usize,
 }
 
 impl Service {
@@ -93,6 +106,11 @@ impl Service {
     ///
     /// Fails rather than overwriting anything unexpected at that path.
     pub fn bind(socket: PathBuf) -> Result<Service, Error> {
+        Service::bind_with_limit(socket, DEFAULT_MAX_CONNECTIONS)
+    }
+
+    /// Bind the service with an explicit client-connection limit.
+    pub fn bind_with_limit(socket: PathBuf, max_connections: usize) -> Result<Service, Error> {
         prepare_socket_path(&socket)?;
 
         let listener = UnixListener::bind(&socket).map_err(|e| {
@@ -114,6 +132,8 @@ impl Service {
             socket,
             handler: Arc::new(Handler::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
+            connections: Arc::new(AtomicUsize::new(0)),
+            max_connections: max_connections.max(1),
         })
     }
 
@@ -199,13 +219,32 @@ impl Service {
                     // Accepted sockets inherit non-blocking mode on some platforms;
                     // a blocking stream is what the protocol expects.
                     let _ = stream.set_nonblocking(false);
+
+                    // The bound is checked *before* spawning, so a burst of
+                    // connections cannot make the service spawn threads without
+                    // limit and then discover it is over budget.
+                    if self.connections.load(Ordering::SeqCst) >= self.max_connections {
+                        // Answered rather than dropped, so the client is told why
+                        // instead of seeing a connection that closes for no stated
+                        // reason. The reply needs no handler thread and no session
+                        // lock, so it cannot itself contribute to the overload.
+                        refuse_overloaded(stream);
+                        continue;
+                    }
+
                     let handler = Arc::clone(&self.handler);
+                    let live = Arc::clone(&self.connections);
+                    live.fetch_add(1, Ordering::SeqCst);
 
                     // Detached: the thread's lifetime is bounded by the client on
                     // the other end. A broken connection is the client's problem,
                     // not the service's, so nothing is logged.
                     std::thread::spawn(move || {
                         let _ = serve_connection(stream, &handler);
+                        // Released on every path, including a panic inside the
+                        // handler, so a failed connection cannot permanently
+                        // consume a slot.
+                        live.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -332,6 +371,32 @@ fn serve_connection(stream: UnixStream, handler: &Handler) -> Result<(), Error> 
 
         write_frame(&mut writer, &response)?;
     }
+}
+
+/// Answer a client with an overload refusal, then close the connection.
+///
+/// The reply is produced inline on the accept loop rather than on a handler thread,
+/// because the whole point is that no further work is started when the service is at
+/// its limit. It takes no session lock and touches no session, so it cannot itself
+/// become a bottleneck.
+///
+/// If even the reply cannot be written, the connection is simply closed. A client that
+/// sees a closed connection must treat it as an overload or an outage; the structured
+/// reply is what makes that explicit when it can be sent at all.
+fn refuse_overloaded(stream: UnixStream) {
+    let mut writer = stream;
+    let response = ResponseEnvelope {
+        request_id: String::new(),
+        ok: false,
+        result: None,
+        error: Some(crate::service::protocol::ErrorBody::from_error(
+            &Error::service_overloaded(
+                "the service is already serving its maximum number of client connections; \
+                 retry shortly, or reuse one connection for multiple requests",
+            ),
+        )),
+    };
+    let _ = write_frame(&mut writer, &response);
 }
 
 /// Validate the socket path before binding.

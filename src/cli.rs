@@ -229,6 +229,69 @@ pub enum SessionCommand {
     WaitStable(SessionObserveArgs),
     /// Observe a session through a transition and then through its settling.
     Observe(SessionObserveArgs),
+    /// Capture a short temporal stack of a scene that may never hold still.
+    ///
+    /// Unlike the three observation commands, this does not wait for any
+    /// condition. It samples the current visual state at a fixed cadence and
+    /// returns what it captured, which is what makes it usable on a scene that is
+    /// constantly moving.
+    Realtime(SessionRealtimeArgs),
+}
+
+/// Arguments for `eensh session realtime`.
+///
+/// There is deliberately no `--mode`, `--pixel-threshold`, or `--area-threshold`:
+/// real-time sampling is unconditional, so it has no threshold to configure.
+#[derive(Debug, Args)]
+pub struct SessionRealtimeArgs {
+    /// The session to sample.
+    #[arg(value_name = "SESSION_ID")]
+    pub session_id: String,
+
+    /// How many fresh frames to capture, 1-8. Defaults to 3.
+    #[arg(long, value_name = "COUNT", value_parser = parse_frame_count)]
+    pub frames: Option<usize>,
+
+    /// Target cadence between sample points, for example `50ms`.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub interval: Option<Duration>,
+
+    /// Deadline after which no new capture is started, for example `500ms`.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub timeout: Option<Duration>,
+
+    #[command(flatten)]
+    pub image: SessionImageArgs,
+
+    /// Embed every returned frame in the response as base64.
+    #[arg(long)]
+    pub base64: bool,
+
+    /// Emit a stable JSON response.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Unix socket of the service to talk to.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+impl SessionRealtimeArgs {
+    /// The sampling options, with the documented real-time defaults.
+    ///
+    /// The defaults are not the temporal-observation ones: a real-time sample
+    /// targets an interactive scene, so three frames at 50ms within 500ms is the
+    /// starting point rather than five seconds of patience.
+    pub fn options(&self) -> Result<crate::realtime::RealtimeOptions, Error> {
+        let default = crate::realtime::RealtimeOptions::default();
+        let options = crate::realtime::RealtimeOptions {
+            frames: self.frames.unwrap_or(default.frames),
+            interval: self.interval.unwrap_or(default.interval),
+            timeout: self.timeout.unwrap_or(default.timeout),
+        };
+        options.validate()?;
+        Ok(options)
+    }
 }
 
 /// Arguments for `eensh session create`.
@@ -517,6 +580,7 @@ impl SessionCommand {
             SessionCommand::WaitChange(args)
             | SessionCommand::WaitStable(args)
             | SessionCommand::Observe(args) => args.json,
+            SessionCommand::Realtime(args) => args.json,
         }
     }
 
@@ -534,6 +598,7 @@ impl SessionCommand {
             SessionCommand::WaitChange(args)
             | SessionCommand::WaitStable(args)
             | SessionCommand::Observe(args) => args.socket.as_ref(),
+            SessionCommand::Realtime(args) => args.socket.as_ref(),
         }
     }
 
@@ -1141,6 +1206,27 @@ fn parse_frame_id(text: &str) -> Result<u64, String> {
         // otherwise be reported as `frame_not_available` rather than as a bad
         // argument.
         return Err("frame IDs start at 1; 0 is not a valid frame ID".to_string());
+    }
+    Ok(value)
+}
+
+/// Parse a real-time frame count.
+///
+/// Bounded by the real-time module's own limit rather than by a number invented
+/// here, so a caller is told the real limit rather than a contradictory one.
+fn parse_frame_count(text: &str) -> Result<usize, String> {
+    let value = text
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("{text:?} is not a frame count"))?;
+    if value == 0 {
+        return Err("a real-time observation must request at least 1 frame".to_string());
+    }
+    if value > crate::realtime::MAX_FRAMES {
+        return Err(format!(
+            "at most {} frames may be requested, got {value}",
+            crate::realtime::MAX_FRAMES
+        ));
     }
     Ok(value)
 }

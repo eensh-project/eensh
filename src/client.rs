@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::Error;
+use crate::presentation::{ChangedRegionPolicy, ObservationPolicy};
 use crate::realtime::{RealtimeOptions, RealtimeOutcome};
 use crate::service::protocol::{
     self, Request, RequestEnvelope, RequestTarget, ResponseBody, ResponseEnvelope, PROTOCOL_VERSION,
@@ -83,6 +84,10 @@ impl ClientSession {
 pub struct ClientRealtime {
     /// The full response, including per-frame images when base64 was requested.
     pub response: RealtimeResponse,
+    /// The Phase 6 multi-view presentation, when a policy was supplied.
+    ///
+    /// `None` means the Phase 5 shape, which is what a caller sending no policy gets.
+    pub presentation: Option<crate::output::json::PresentationResponse>,
 }
 
 impl ClientRealtime {
@@ -114,6 +119,85 @@ impl ClientRealtime {
     /// The frames, oldest first.
     pub fn frames(&self) -> &[crate::session::realtime::RealtimeFrameResponse] {
         &self.response.frames
+    }
+
+    /// The Phase 5 response shape, for a caller that only samples.
+    pub fn phase5(&self) -> &RealtimeResponse {
+        &self.response
+    }
+}
+
+/// A frame response, with its Phase 6 presentation when one was requested.
+///
+/// The presentation is optional rather than defaulted, because its absence is what
+/// tells a caller it received the Phase 5 shape — a fact worth being able to check
+/// rather than infer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientFrame {
+    /// The Phase 4 frame result.
+    pub frame: crate::session::pipeline::SessionFrameResponse,
+    /// The Phase 6 multi-view presentation, when a policy was supplied.
+    pub presentation: Option<crate::output::json::PresentationResponse>,
+}
+
+impl ClientFrame {
+    /// Unwrap the wire form, which boxes both fields.
+    ///
+    /// The boxes exist on the wire so that a large presentation does not inflate every
+    /// response variant; the client immediately unboxes them, because a caller of a
+    /// typed client should not have to think about protocol sizing.
+    fn from_wire(
+        frame: Box<crate::session::pipeline::SessionFrameResponse>,
+        presentation: Option<Box<crate::output::json::PresentationResponse>>,
+    ) -> Self {
+        ClientFrame {
+            frame: *frame,
+            presentation: presentation.map(|boxed| *boxed),
+        }
+    }
+
+    /// The frame's identity.
+    pub fn frame_id(&self) -> FrameId {
+        self.frame.frame_id
+    }
+
+    /// The first view with this name, searching every frame in the presentation.
+    pub fn view(&self, name: &str) -> Option<&crate::output::json::ViewResponse> {
+        let presentation = self.presentation.as_ref()?;
+        presentation
+            .frames
+            .iter()
+            .flat_map(|frame| frame.views.iter())
+            .find(|view| view.name == name)
+    }
+
+    /// The whole-frame overview, when one was requested.
+    pub fn overview(&self) -> Option<&crate::output::json::ViewResponse> {
+        self.view("overview")
+    }
+}
+
+/// A comparison response, with its changed-region view when one was requested.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientDiff {
+    /// The Phase 2 comparison, unchanged.
+    pub comparison: crate::compare::Comparison,
+    /// The changed-region view, when the request asked for one.
+    pub changed_view: Option<crate::output::json::ChangedRegionResponse>,
+}
+
+impl ClientDiff {
+    /// Whether the comparison crossed the thresholds.
+    pub fn changed(&self) -> bool {
+        self.comparison.changed
+    }
+
+    /// The factual bounding box, whether or not the comparison counted as a change.
+    ///
+    /// The two are deliberately separate: a sub-threshold change leaves this set while
+    /// `changed` stays false (requirement 11).
+    pub fn bounding_box(&self) -> Option<crate::geometry::Rect> {
+        self.comparison.bounding_box
     }
 }
 
@@ -422,16 +506,38 @@ impl EenshClient {
     }
 
     /// Capture a fresh frame.
+    ///
+    /// Unchanged since Phase 4, so every existing caller keeps working
+    /// (requirement 70). Use [`EenshClient::capture_presented`] to attach a Phase 6
+    /// policy.
     pub fn capture(
         &mut self,
         session_id: &str,
         image: ImageSpec,
     ) -> Result<crate::session::pipeline::SessionFrameResponse, Error> {
+        self.capture_presented(session_id, image, None)
+            .map(|presented| presented.frame)
+    }
+
+    /// Capture a fresh frame under a presentation policy.
+    ///
+    /// `presentation` is the Phase 6 policy. Passing `None` reproduces the Phase 5
+    /// behaviour exactly: one whole-frame image, described by `image`.
+    pub fn capture_presented(
+        &mut self,
+        session_id: &str,
+        image: ImageSpec,
+        presentation: Option<&ObservationPolicy>,
+    ) -> Result<ClientFrame, Error> {
         match self.call(Request::SessionCapture {
             session_id: session_id.to_string(),
             output: image.to_wire()?,
+            presentation: presentation.cloned().map(Box::new),
         })? {
-            ResponseBody::Frame { frame } => Ok(frame),
+            ResponseBody::Frame {
+                frame,
+                presentation,
+            } => Ok(ClientFrame::from_wire(frame, presentation)),
             other => Err(unexpected("capture", &other)),
         }
     }
@@ -442,11 +548,26 @@ impl EenshClient {
         session_id: &str,
         image: ImageSpec,
     ) -> Result<crate::session::pipeline::SessionFrameResponse, Error> {
+        self.latest_presented(session_id, image, None)
+            .map(|presented| presented.frame)
+    }
+
+    /// Return the newest retained frame, presented under a policy.
+    pub fn latest_presented(
+        &mut self,
+        session_id: &str,
+        image: ImageSpec,
+        presentation: Option<&ObservationPolicy>,
+    ) -> Result<ClientFrame, Error> {
         match self.call(Request::SessionLatest {
             session_id: session_id.to_string(),
             output: image.to_wire()?,
+            presentation: presentation.cloned().map(Box::new),
         })? {
-            ResponseBody::Frame { frame } => Ok(frame),
+            ResponseBody::Frame {
+                frame,
+                presentation,
+            } => Ok(ClientFrame::from_wire(frame, presentation)),
             other => Err(unexpected("latest", &other)),
         }
     }
@@ -458,12 +579,32 @@ impl EenshClient {
         frame_id: FrameId,
         image: ImageSpec,
     ) -> Result<crate::session::pipeline::SessionFrameResponse, Error> {
+        self.frame_presented(session_id, frame_id, image, None)
+            .map(|presented| presented.frame)
+    }
+
+    /// Return a specific retained frame, presented under a policy.
+    ///
+    /// This is the re-presentation path: any retained frame can be rendered again
+    /// under a different policy, and no new frame identity is allocated
+    /// (requirement 42).
+    pub fn frame_presented(
+        &mut self,
+        session_id: &str,
+        frame_id: FrameId,
+        image: ImageSpec,
+        presentation: Option<&ObservationPolicy>,
+    ) -> Result<ClientFrame, Error> {
         match self.call(Request::SessionFrame {
             session_id: session_id.to_string(),
             frame_id,
             output: image.to_wire()?,
+            presentation: presentation.cloned().map(Box::new),
         })? {
-            ResponseBody::Frame { frame } => Ok(frame),
+            ResponseBody::Frame {
+                frame,
+                presentation,
+            } => Ok(ClientFrame::from_wire(frame, presentation)),
             other => Err(unexpected("frame", &other)),
         }
     }
@@ -476,13 +617,30 @@ impl EenshClient {
         after: FrameId,
         options: &crate::compare::CompareOptions,
     ) -> Result<crate::compare::Comparison, Error> {
+        self.diff_with_changed_region(session_id, before, after, options, None)
+            .map(|diff| diff.comparison)
+    }
+
+    /// Compare two retained frames and optionally crop the changed region.
+    pub fn diff_with_changed_region(
+        &mut self,
+        session_id: &str,
+        before: FrameId,
+        after: FrameId,
+        options: &crate::compare::CompareOptions,
+        changed: Option<&ChangedRegionPolicy>,
+    ) -> Result<ClientDiff, Error> {
         match self.call(Request::SessionDiff {
             session_id: session_id.to_string(),
             before,
             after,
             compare: (*options).into(),
+            changed: changed.copied(),
         })? {
-            ResponseBody::Diff { diff } => Ok(diff.comparison),
+            ResponseBody::Diff { diff, changed_view } => Ok(ClientDiff {
+                comparison: diff.comparison,
+                changed_view,
+            }),
             other => Err(unexpected("diff", &other)),
         }
     }
@@ -498,12 +656,33 @@ impl EenshClient {
         options: &RealtimeOptions,
         image: ImageSpec,
     ) -> Result<ClientRealtime, Error> {
+        self.realtime_presented(session_id, options, image, None)
+    }
+
+    /// Capture a bounded real-time stack and present it under a policy.
+    ///
+    /// A [`TemporalFramePolicy`](crate::presentation::TemporalFramePolicy) is usually
+    /// what a caller wants here, so that the older frames cost less than the newest.
+    pub fn realtime_presented(
+        &mut self,
+        session_id: &str,
+        options: &RealtimeOptions,
+        image: ImageSpec,
+        presentation: Option<&ObservationPolicy>,
+    ) -> Result<ClientRealtime, Error> {
         match self.call(Request::SessionRealtime {
             session_id: session_id.to_string(),
             realtime: (*options).into(),
             output: image.to_wire()?,
+            presentation: presentation.cloned().map(Box::new),
         })? {
-            ResponseBody::Realtime { realtime } => Ok(ClientRealtime { response: realtime }),
+            ResponseBody::Realtime {
+                realtime,
+                presentation,
+            } => Ok(ClientRealtime {
+                response: *realtime,
+                presentation: presentation.map(|boxed| *boxed),
+            }),
             other => Err(unexpected("realtime", &other)),
         }
     }
@@ -555,8 +734,9 @@ impl EenshClient {
             temporal,
             stable_for_ms,
             output: image.to_wire()?,
+            presentation: None,
         })? {
-            ResponseBody::Observation { observation } => Ok(observation),
+            ResponseBody::Observation { observation, .. } => Ok(*observation),
             other => Err(unexpected("observe", &other)),
         }
     }

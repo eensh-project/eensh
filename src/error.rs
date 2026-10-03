@@ -93,6 +93,17 @@ pub enum Error {
     ServiceProtocolError(String),
     /// The service refused the request because it is overloaded.
     ServiceOverloaded(String),
+    /// The presentation policy is malformed or self-contradictory.
+    ///
+    /// A policy that cannot mean anything is refused outright rather than being
+    /// silently repaired, because a silently repaired policy is one the caller
+    /// cannot reason about or reproduce.
+    InvalidPresentationPolicy(String),
+    /// The visual payload cannot fit the requested budget.
+    ///
+    /// Distinct from a sampling failure: the frames were captured successfully and
+    /// remain in history. Only their presentation could not be made to fit.
+    PayloadBudgetExceeded(String),
     /// An unexpected internal failure.
     Internal(String),
 }
@@ -246,6 +257,8 @@ impl Error {
             "no_frame_available" => Error::NoFrameAvailable(message.to_string()),
             "service_unavailable" => Error::ServiceUnavailable(message.to_string()),
             "service_overloaded" => Error::ServiceOverloaded(message.to_string()),
+            "invalid_presentation_policy" => Error::InvalidPresentationPolicy(message.to_string()),
+            "payload_budget_exceeded" => Error::PayloadBudgetExceeded(message.to_string()),
             "service_protocol_error" => Error::ServiceProtocolError(message.to_string()),
             other => Error::service_protocol_error(format!(
                 "the service reported {other:?}, which this client does not recognise: \
@@ -266,6 +279,16 @@ impl Error {
                 | Error::TargetLost(_)
                 | Error::DisplayUnavailable { .. }
         )
+    }
+
+    /// Convenience constructor for [`Error::InvalidPresentationPolicy`].
+    pub fn invalid_presentation_policy(message: impl Into<String>) -> Self {
+        Error::InvalidPresentationPolicy(message.into())
+    }
+
+    /// Convenience constructor for [`Error::PayloadBudgetExceeded`].
+    pub fn payload_budget_exceeded(message: impl Into<String>) -> Self {
+        Error::PayloadBudgetExceeded(message.into())
     }
 
     /// Convenience constructor for [`Error::Internal`].
@@ -299,6 +322,8 @@ impl Error {
             Error::ServiceUnavailable(_) => "service_unavailable",
             Error::ServiceProtocolError(_) => "service_protocol_error",
             Error::ServiceOverloaded(_) => "service_overloaded",
+            Error::InvalidPresentationPolicy(_) => "invalid_presentation_policy",
+            Error::PayloadBudgetExceeded(_) => "payload_budget_exceeded",
             Error::Internal(_) => "internal_error",
         }
     }
@@ -330,6 +355,10 @@ impl Error {
             Error::ServiceUnavailable(_) => 22,
             Error::ServiceProtocolError(_) => 23,
             Error::ServiceOverloaded(_) => 24,
+            // Phase 6. Payload failure is not a sampling failure: the frames were
+            // captured and retained, and only their presentation could not fit.
+            Error::InvalidPresentationPolicy(_) => 25,
+            Error::PayloadBudgetExceeded(_) => 26,
         }
     }
 
@@ -363,6 +392,10 @@ impl Error {
             Error::ServiceUnavailable(m) => format!("service unavailable: {m}"),
             Error::ServiceProtocolError(m) => format!("service protocol error: {m}"),
             Error::ServiceOverloaded(m) => format!("service overloaded: {m}"),
+            Error::InvalidPresentationPolicy(m) => {
+                format!("invalid presentation policy: {m}")
+            }
+            Error::PayloadBudgetExceeded(m) => format!("payload budget exceeded: {m}"),
             Error::Internal(m) => format!("internal error: {m}"),
         }
     }
@@ -403,6 +436,16 @@ mod tests {
                 3,
             ),
             (Error::InvalidRegion("x".into()), "invalid_region", 4),
+            (
+                Error::InvalidPresentationPolicy("x".into()),
+                "invalid_presentation_policy",
+                25,
+            ),
+            (
+                Error::PayloadBudgetExceeded("x".into()),
+                "payload_budget_exceeded",
+                26,
+            ),
             (
                 Error::WindowNotFound {
                     window_id: "0x1".into(),

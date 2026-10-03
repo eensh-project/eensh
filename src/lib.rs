@@ -93,6 +93,7 @@ pub mod input;
 pub mod observe;
 pub mod output;
 pub mod pipeline;
+pub mod presentation;
 pub mod realtime;
 pub mod resize;
 pub mod service;

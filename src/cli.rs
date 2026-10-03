@@ -21,6 +21,10 @@ use crate::geometry::Rect;
 use crate::observe::{ObserveOptions, TemporalCompareOptions, WaitStableOptions};
 use crate::output::{Destination, MetadataDestination, OutputPlan};
 use crate::pipeline::ImageOptions;
+use crate::presentation::policy::{
+    ImageFloors, ImagePolicy, ObservationPolicy, PayloadBudget, RegionPolicy, ResizePolicy,
+};
+use crate::presentation::{ChangedRegionPolicy, TemporalFramePolicy};
 
 /// `eensh` — agent-ready X11 screenshot capture.
 #[derive(Debug, Parser)]
@@ -147,6 +151,8 @@ pub enum SessionCommand {
         session_id: String,
         #[command(flatten)]
         image: SessionImageArgs,
+        #[command(flatten)]
+        presentation: PresentationArgs,
         /// Embed the frame in the response as base64.
         #[arg(long)]
         base64: bool,
@@ -164,6 +170,8 @@ pub enum SessionCommand {
         session_id: String,
         #[command(flatten)]
         image: SessionImageArgs,
+        #[command(flatten)]
+        presentation: PresentationArgs,
         /// Embed the frame in the response as base64.
         #[arg(long)]
         base64: bool,
@@ -184,6 +192,8 @@ pub enum SessionCommand {
         frame_id: u64,
         #[command(flatten)]
         image: SessionImageArgs,
+        #[command(flatten)]
+        presentation: PresentationArgs,
         /// Embed the frame in the response as base64.
         #[arg(long)]
         base64: bool,
@@ -214,6 +224,8 @@ pub enum SessionCommand {
         /// Smallest changed fraction still considered meaningful change, 0.0-1.0.
         #[arg(long, value_name = "0.0-1.0", value_parser = parse_area_threshold)]
         area_threshold: Option<f64>,
+        #[command(flatten)]
+        presentation: PresentationArgs,
         /// Emit a stable JSON response.
         #[arg(long)]
         json: bool,
@@ -263,10 +275,13 @@ pub struct SessionRealtimeArgs {
     #[command(flatten)]
     pub image: SessionImageArgs,
 
+    /// Phase 6 presentation policy.
+    #[command(flatten)]
+    pub presentation: PresentationArgs,
+
     /// Embed every returned frame in the response as base64.
     #[arg(long)]
     pub base64: bool,
-
     /// Emit a stable JSON response.
     #[arg(long)]
     pub json: bool,
@@ -471,7 +486,6 @@ impl SessionObserveArgs {
 /// delivered in the response, either inline as base64 or not at all.
 #[derive(Debug, Clone, Args)]
 pub struct SessionImageArgs {
-    /// Output image format: `png` or `jpeg`.
     #[arg(long, value_name = "FORMAT")]
     pub format: Option<String>,
 
@@ -563,6 +577,416 @@ impl SessionImageArgs {
         }
         Ok(ResizeRequest::None)
     }
+}
+
+/// The Phase 6 presentation surface.
+///
+/// Flattened into every command that can present a frame, so `session capture`,
+/// `session frame`, and `session realtime` are configured the same way. Every field
+/// is optional: a command with no presentation flags resolves to "no policy", which
+/// is the Phase 5 behaviour exactly.
+///
+/// The flags resolve to a *structured* policy rather than an opaque profile name
+/// (requirement 38). `--presentation agent-efficient` is shorthand for a policy a
+/// caller could equally have written out in full, and the resolved policy is what
+/// travels.
+#[derive(Debug, Clone, Args, Default)]
+pub struct PresentationArgs {
+    /// Whole-frame overview width, preserving the aspect ratio.
+    #[arg(long, value_name = "WIDTH", value_parser = clap::value_parser!(u32).range(1..))]
+    pub overview_width: Option<u32>,
+
+    /// Overview format: `png` or `jpeg`.
+    #[arg(long, value_name = "FORMAT")]
+    pub overview_format: Option<String>,
+
+    /// Overview JPEG quality, 1-100.
+    #[arg(long, value_name = "QUALITY", value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub overview_quality: Option<u8>,
+
+    /// Omit the whole-frame overview entirely, sending only regions.
+    #[arg(long)]
+    pub no_overview: bool,
+
+    /// Present identity, timing, and geometry with no image bytes at all.
+    ///
+    /// The views are still described in full — name, source rectangle, transform, and the
+    /// settings that would have been applied — so a caller can decide which view is worth
+    /// paying for and ask for it next time. This is the cheapest presentation there is, and
+    /// the one that establishes the timing floor in section 52's isolation test.
+    #[arg(long)]
+    pub metadata_only: bool,
+
+    /// A named source-space region, as `NAME=X,Y,WIDTH,HEIGHT`. Repeatable.
+    ///
+    /// Coordinates are native source pixels, never overview pixels.
+    #[arg(long, value_name = "NAME=X,Y,W,H", value_parser = parse_region_policy)]
+    pub region: Vec<RegionPolicyArg>,
+
+    /// Width for `--region` crops that do not name their own, preserving aspect.
+    #[arg(long, value_name = "WIDTH", value_parser = clap::value_parser!(u32).range(1..))]
+    pub region_width: Option<u32>,
+
+    /// Format for `--region` crops that do not name their own: `png` or `jpeg`.
+    #[arg(long, value_name = "FORMAT")]
+    pub region_format: Option<String>,
+
+    /// JPEG quality for `--region` crops that do not name their own.
+    #[arg(long, value_name = "QUALITY", value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub region_quality: Option<u8>,
+
+    /// Width for the older frames of a real-time stack.
+    #[arg(long, value_name = "WIDTH", value_parser = clap::value_parser!(u32).range(1..))]
+    pub older_width: Option<u32>,
+
+    /// JPEG quality for the older frames of a real-time stack.
+    #[arg(long, value_name = "QUALITY", value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub older_quality: Option<u8>,
+
+    /// Width for the newest frame of a real-time stack.
+    #[arg(long, value_name = "WIDTH", value_parser = clap::value_parser!(u32).range(1..))]
+    pub newest_width: Option<u32>,
+
+    /// JPEG quality for the newest frame of a real-time stack.
+    #[arg(long, value_name = "QUALITY", value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub newest_quality: Option<u8>,
+
+    /// Temporal policy: `all-same`, `newest-detailed`, `newest-only`, or
+    /// `metadata-older`.
+    #[arg(long, value_name = "MODE")]
+    pub temporal: Option<String>,
+
+    /// Most base64 bytes the visual payload may occupy.
+    #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(usize))]
+    pub max_base64_bytes: Option<usize>,
+
+    /// Crop to the Phase 2 changed region, for `session diff`.
+    #[arg(long)]
+    pub changed_region: bool,
+
+    /// Padding to add around the changed region, in source pixels.
+    #[arg(long, value_name = "PIXELS", default_value_t = 0)]
+    pub changed_padding: u32,
+
+    /// Width for the changed-region crop.
+    #[arg(long, value_name = "WIDTH", value_parser = clap::value_parser!(u32).range(1..))]
+    pub changed_width: Option<u32>,
+
+    /// Format for the changed-region crop: `png` or `jpeg`.
+    #[arg(long, value_name = "FORMAT")]
+    pub changed_format: Option<String>,
+
+    /// Whether the changed view may be dropped to meet a payload budget.
+    ///
+    /// A changed crop is required by default: a caller that asked for it asked for a
+    /// reason, and silently dropping it would be worse than failing. This flag opts
+    /// into treating it as expendable.
+    #[arg(long)]
+    pub changed_optional: bool,
+}
+
+impl PresentationArgs {
+    /// Whether any presentation flag was supplied.
+    pub fn is_empty(&self) -> bool {
+        !self.no_overview
+            && !self.metadata_only
+            && self.overview_width.is_none()
+            && self.overview_format.is_none()
+            && self.overview_quality.is_none()
+            && self.region.is_empty()
+            && self.temporal.is_none()
+            && self.max_base64_bytes.is_none()
+            && !self.changed_region
+            && self.older_width.is_none()
+            && self.older_quality.is_none()
+            && self.newest_width.is_none()
+            && self.newest_quality.is_none()
+    }
+
+    /// Resolve into a policy, or `None` when nothing was requested.
+    ///
+    /// `None` is the important case: it is what preserves the Phase 5 behaviour for a
+    /// caller that never mentions presentation (requirement 37).
+    pub fn resolve(&self) -> Result<Option<ObservationPolicy>, Error> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+
+        let default_overview = ImagePolicy {
+            resize: match self.overview_width {
+                Some(width) => ResizePolicy::Width { width },
+                None => ResizePolicy::None,
+            },
+            format: match self.overview_format.as_deref() {
+                Some(name) => ImageFormat::from_name(name)?,
+                None => ImageFormat::Jpeg,
+            },
+            quality: self.overview_quality.unwrap_or(75),
+            metadata_only: self.metadata_only,
+            // A metadata-only view carries no pixels, so embedding one is a contradiction the
+            // policy validator refuses. Implied here rather than left to the caller to remember.
+            base64: !self.metadata_only,
+            ..ImagePolicy::png()
+        };
+
+        let region_image = ImagePolicy {
+            resize: match self.region_width {
+                Some(width) => ResizePolicy::Width { width },
+                None => ResizePolicy::None,
+            },
+            format: match self.region_format.as_deref() {
+                Some(name) => ImageFormat::from_name(name)?,
+                None => ImageFormat::Png,
+            },
+            quality: self.region_quality.unwrap_or(jpeg::DEFAULT_QUALITY),
+            metadata_only: self.metadata_only,
+            base64: !self.metadata_only,
+            ..ImagePolicy::png()
+        };
+
+        let regions = self
+            .region
+            .iter()
+            .map(|region| {
+                let mut policy = RegionPolicy::required(
+                    region.name.clone(),
+                    region.rect,
+                    region.image.unwrap_or(region_image),
+                );
+                if let Some(scope) = &region.scope {
+                    policy = policy.with_scope(*scope);
+                }
+                if let Some(priority) = region.priority {
+                    policy = policy.with_priority(priority);
+                }
+                Ok(policy)
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let temporal = self.resolve_temporal(&default_overview)?;
+
+        let overview = if self.no_overview {
+            None
+        } else if temporal.is_some() {
+            // With a temporal policy the overview's settings come from that policy, so
+            // declaring one here would be a second, conflicting statement of the same
+            // thing. Its presence still matters: it is what enables the whole-frame
+            // view at all.
+            Some(default_overview)
+        } else {
+            Some(default_overview)
+        };
+
+        let changed = if self.changed_region {
+            Some(ChangedRegionPolicy {
+                padding: self.changed_padding,
+                image: ImagePolicy {
+                    resize: match self.changed_width {
+                        Some(width) => ResizePolicy::Width { width },
+                        None => ResizePolicy::None,
+                    },
+                    format: match self.changed_format.as_deref() {
+                        Some(name) => ImageFormat::from_name(name)?,
+                        None => ImageFormat::Png,
+                    },
+                    metadata_only: self.metadata_only,
+                    base64: !self.metadata_only,
+                    ..ImagePolicy::png()
+                },
+                max_fraction: None,
+                // Required unless the caller explicitly opted out, so a changed crop
+                // cannot vanish without the request having said it may.
+                required: !self.changed_optional,
+            })
+        } else {
+            None
+        };
+
+        let policy = ObservationPolicy {
+            overview,
+            regions,
+            temporal,
+            payload_budget: self.max_base64_bytes.map(PayloadBudget::new),
+            changed,
+        };
+        policy.validate()?;
+        Ok(Some(policy))
+    }
+
+    /// Resolve the temporal policy, if one was asked for.
+    fn resolve_temporal(
+        &self,
+        overview: &ImagePolicy,
+    ) -> Result<Option<TemporalFramePolicy>, Error> {
+        let older_resize = match self.older_width {
+            Some(width) => ResizePolicy::Width { width },
+            None => overview.resize,
+        };
+        let newest_resize = match self.newest_width {
+            Some(width) => ResizePolicy::Width { width },
+            None => overview.resize,
+        };
+
+        let older = ImagePolicy {
+            resize: older_resize,
+            // The default older quality is the point of a newest-detailed policy, so
+            // it applies even when the shared overview settings were explicit.
+            quality: self.older_quality.unwrap_or(55),
+            // Floors are derived from what was actually *requested*, never from a
+            // fixed ladder. A fixed floor of, say, 320 would sit above a caller's
+            // deliberate `--older-width 160`, leaving the fitter nothing it was
+            // allowed to reduce — a confusing way to fail.
+            floors: Some(derived_floors(older_resize, self.older_quality, 0.5, 15)),
+            ..*overview
+        };
+        let newest = ImagePolicy {
+            resize: newest_resize,
+            quality: self.newest_quality.unwrap_or(75),
+            // The newest frame uses the same rule with a tighter allowance, so it is
+            // protected relative to whatever the caller asked for rather than relative
+            // to an absolute number that might not suit the request at all.
+            floors: Some(derived_floors(newest_resize, self.newest_quality, 0.75, 10)),
+            ..*overview
+        };
+
+        let named = match self.temporal.as_deref() {
+            Some(name) => Some(name),
+            None => {
+                // Infer from the flags: naming older or newest settings is itself a
+                // request for a differing treatment. An opaque profile would hide
+                // this; stating the inference keeps the resolution predictable.
+                if self.older_width.is_some()
+                    || self.older_quality.is_some()
+                    || self.newest_width.is_some()
+                    || self.newest_quality.is_some()
+                {
+                    Some("newest-detailed")
+                } else {
+                    None
+                }
+            }
+        };
+
+        let Some(name) = named else {
+            return Ok(None);
+        };
+
+        let policy = match name {
+            "all-same" => TemporalFramePolicy::AllSame { image: *overview },
+            "newest-detailed" => TemporalFramePolicy::NewestDetailed { older, newest },
+            "newest-only" => TemporalFramePolicy::NewestOnly { image: newest },
+            "metadata-older" => TemporalFramePolicy::MetadataOlder { newest },
+            other => {
+                return Err(Error::invalid_arguments(format!(
+                    "{other:?} is not a temporal presentation mode; expected one of \
+                     all-same, newest-detailed, newest-only, metadata-older"
+                )))
+            }
+        };
+        Ok(Some(policy))
+    }
+}
+
+/// One `--region` argument, before it is resolved against the shared flags.
+#[derive(Debug, Clone)]
+pub struct RegionPolicyArg {
+    /// The region's name.
+    pub name: String,
+    /// Its source-space rectangle.
+    pub rect: Rect,
+    /// Its own image settings, when it named any.
+    pub image: Option<ImagePolicy>,
+    /// Where in a temporal stack it applies.
+    pub scope: Option<crate::presentation::RegionScope>,
+    /// Its fitting priority.
+    pub priority: Option<u8>,
+}
+
+/// Derive floors from what a caller actually asked for.
+///
+/// `width_fraction` is the share of the requested width the fitter may reduce to and
+/// `quality_drop` is how many quality points it may shed. Expressing floors this way
+/// means they are always *below* the request, so there is always room to fit, and the
+/// protection a frame gets is relative to the detail the caller chose rather than to
+/// a fixed number that might not suit the request.
+fn derived_floors(
+    resize: ResizePolicy,
+    requested_quality: Option<u8>,
+    width_fraction: f64,
+    quality_drop: u8,
+) -> ImageFloors {
+    let min_width = match resize {
+        ResizePolicy::Width { width } => Some(((width as f64 * width_fraction) as u32).max(16)),
+        ResizePolicy::Height { height } => Some(((height as f64 * width_fraction) as u32).max(16)),
+        // A scale factor or a native request has no width to halve, so the fitter is
+        // allowed to pick any width the ladder offers. That is the honest answer: the
+        // caller did not express a size preference to protect.
+        ResizePolicy::Scale { .. } | ResizePolicy::None => None,
+    };
+    let min_quality = requested_quality
+        .map(|quality| quality.saturating_sub(quality_drop).max(10))
+        .or(Some(40));
+    ImageFloors {
+        min_width,
+        min_quality,
+    }
+}
+
+/// Parse `NAME=X,Y,W,H`, with optional `@scope` and `!priority` suffixes.
+///
+/// The suffixes exist so a caller can express the common cases without a second
+/// flag: `hud=0,900,1920,180@newest` is a HUD crop taken from the newest frame only.
+fn parse_region_policy(text: &str) -> Result<RegionPolicyArg, String> {
+    let (name, rest) = text
+        .split_once('=')
+        .ok_or_else(|| format!("{text:?} is not NAME=X,Y,W,H"))?;
+    if name.is_empty() {
+        return Err("a region must have a name".to_string());
+    }
+
+    let (coords, suffix) = match rest.split_once('@') {
+        Some((coords, suffix)) => (coords, Some(suffix)),
+        None => (rest, None),
+    };
+
+    let rect = parse_region(coords)?;
+
+    let (scope, priority) = match suffix {
+        None => (None, None),
+        Some(suffix) => {
+            let mut scope = None;
+            let mut priority = None;
+            for part in suffix.split(',') {
+                match part {
+                    "all" => scope = Some(crate::presentation::RegionScope::All),
+                    "newest" => scope = Some(crate::presentation::RegionScope::Newest),
+                    "older" => scope = Some(crate::presentation::RegionScope::Older),
+                    other => match other.strip_prefix('!') {
+                        Some(value) => {
+                            priority = Some(value.parse::<u8>().map_err(|_| {
+                                format!("{value:?} is not a region priority in 0..=255")
+                            })?)
+                        }
+                        None => {
+                            return Err(format!(
+                                "{other:?} is not a region suffix; expected all, newest, older, \
+                                 or !PRIORITY"
+                            ))
+                        }
+                    },
+                }
+            }
+            (scope, priority)
+        }
+    };
+
+    Ok(RegionPolicyArg {
+        name: name.to_string(),
+        rect,
+        image: None,
+        scope,
+        priority,
+    })
 }
 
 impl SessionCommand {

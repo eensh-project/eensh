@@ -238,6 +238,8 @@ with `--json` — a structured error:
 | 22 | `service_unavailable` | No `eensh serve` could be reached at the socket path. |
 | 23 | `service_protocol_error` | The service could not decode a request, or a protocol version was refused. |
 | 24 | `service_overloaded` | The service refused work to preserve freshness. |
+| 25 | `invalid_presentation_policy` | The presentation policy is malformed or self-contradictory. |
+| 26 | `payload_budget_exceeded` | The required views cannot fit in the requested budget, even at their floors. |
 | 100 | *(none)* | **Timeout**: the observation ran, the condition did not occur. |
 
 Exit statuses are stable and are part of the interface. A service error crosses
@@ -1190,6 +1192,194 @@ Real-time observation reuses the existing table: `session_busy` (18),
 is terminal and marks the session failed, exactly as it does for `observe`. A
 partial stack is exit 0.
 
+## Efficient presentation
+
+Everything above answers *what is on the screen*. Presentation answers a different
+question: **what is worth sending back?** An agent watching a 1920×1080 game does
+not need four full-resolution screenshots to know what happened; it needs one recent
+whole-frame view and the details it actually cares about.
+
+The rule that keeps this from leaking into everything else is that presentation
+happens strictly **after** raw observation:
+
+```text
+capture / observe / realtime
+    -> raw Frame or raw Frame stack        (when the pixels were taken)
+    -> presentation policy                 (what to send)
+    -> View(s)                             (overview, regions, the changed crop)
+    -> encode                              (presentation work)
+    -> base64 / protocol response
+```
+
+Nothing in the presentation layer captures, compares, schedules, or touches history.
+It is handed frames that already exist and decides how to render them, which is what
+lets one raw observation produce several alternative presentations, and what keeps
+Phase 6 from quietly changing Phase 1–5 semantics. **With no presentation flags, the
+output is byte-for-byte what it was before Phase 6.**
+
+### Overview plus ROI
+
+The common request is "show me the whole screen cheaply, and these areas in detail".
+`--region` names a rectangle in **source** coordinates, so a crop of a window at
+source `(100, 200)` reports `(100, 200)` rather than a frame-local offset and a
+caller never has to reconstruct where it came from.
+
+```bash
+# A cheap overview plus a HUD strip and a minimap, each with its own format.
+eensh session capture "$SID" --json --base64 \
+  --overview-width 480 --overview-format jpeg --overview-quality 60 \
+  --region 'hud=0,0,1920,180' --region-format png \
+  --region 'map=1600,880,320,200@newest!180' --region-format jpeg --region-quality 80
+```
+
+A region may carry a scope and a fitting priority as suffixes: `NAME=X,Y,W,H@SCOPE`
+or `@!PRIORITY`, comma-separated when both are given (`@all,!140`). The scope
+(`all`, `newest`, `older`) limits which frames of a temporal stack the region
+applies to; the priority orders what the budget fitter degrades first.
+
+In a response, a view reports `source_rect` (in source coordinates), `transform`
+(mapping view pixels back to source pixels), and `applied` — the settings *actually*
+used, which is not always what was asked for once a budget has been fitted. A
+metadata-only view has a null image and says `"metadata_only": true`, so a view with
+no pixels is never confused with one that failed to encode.
+
+### Temporal policy
+
+For a real-time stack, `--temporal` says how each frame should be treated:
+
+| Mode | Effect |
+|---|---|
+| `all-same` | Every frame identically. The Phase 5 behaviour. |
+| `newest-detailed` | Older frames reduced, the newest preserved. |
+| `newest-only` | Only the newest carries image bytes. |
+| `metadata-older` | Older frames keep identity and timing, no image. |
+
+```bash
+eensh session realtime "$SID" --json --base64 --frames 4 --interval 40ms \
+  --temporal newest-detailed --older-width 320 --older-quality 45 \
+  --newest-width 640 --newest-quality 85
+```
+
+The newest frame is protected: the fitting ladder spends every older lever — quality
+first, then resolution, then optional views — before touching the newest at all. But
+**reduction is not deletion**. Asking for four frames and receiving one would be a
+silent lie, because what came back would look complete; every requested frame is
+reported, with fewer bytes rather than fewer frames.
+
+### Payload budget
+
+`--max-base64-bytes` bounds the visual payload. Fitting is **opt-in**: with room to
+spare, nothing is adjusted and the response says `"fit": "exact"`. Under pressure the
+fitter walks a fixed ladder, always in this order:
+
+```text
+1. older frame quality        ->   2. older frame resolution
+3. omit optional views        ->   4. newest quality
+5. newest resolution
+```
+
+Each rung is exhausted before the next is considered, or the ordering would be a
+formality rather than a protection. Required views are never omitted: a budget that
+cannot hold them fails with `payload_budget_exceeded` (exit 26) and a message quoting
+**the smallest achievable payload**, so the caller can pick a workable number
+instead of guessing again. That floor is computed by walking the same ladder, and it
+is never above what the unfitted request would have cost.
+
+Every adjustment is reported, with the numbers that changed:
+
+```json
+"payload": {
+  "budget_base64_bytes": 300000,
+  "actual_base64_bytes": 287400,
+  "fit": "adjusted",
+  "adjustments": [
+    { "change": "quality", "frame_id": 2, "view": "overview", "requested": 85, "actual": 65 },
+    { "change": "omitted", "frame_id": 1, "view": "minimap",
+      "reason": "optional view omitted to meet the payload budget" }
+  ]
+}
+```
+
+Fitting is deterministic: identical raw frames and an identical policy produce an
+identical plan, because the ladder orders views by a single total key rather than by
+the order a hash map happened to yield. The fitted plan is itself a comparable value.
+
+### The changed crop
+
+For `diff`, `--changed-region` returns the Phase 2 bounding box as a view, cropped
+from the **newer** frame. `--changed-padding` widens it, clamped at the source edges;
+the factual `raw_changed_rect` and the `returned_rect` are reported separately so a
+change at the screen edge is never mistaken for a large one.
+
+A changed crop is *required* by default — a caller that asked for it asked for a
+reason — and `--changed-optional` opts into treating it as expendable. Note that
+Phase 2's two answers stay distinct: `bounding_box` is a fact about pixels, `changed`
+is a policy verdict about area. A sub-threshold change has an empty verdict and a
+real bounding box, and a requested crop is still returned for it.
+
+### Cost
+
+Measured against a live 640×480 Xvfb scene, five frames at 40 ms cadence, comparing
+policies **within one format** (this matters: a field of flat blocks compresses to
+almost nothing as PNG and costs a great deal as JPEG, so a cross-format comparison
+measures the codec rather than the policy):
+
+| Policy | Payload | Response | Presentation | Newest age |
+|---|---|---|---|---|
+| all-same JPEG q85 | 271,340 B | 290,614 B | 1,009 ms | 1,190 ms |
+| `newest-detailed` | 117,100 B | 136,382 B | 469 ms | 649 ms |
+| `newest-only` | 54,268 B | 72,845 B | 202 ms | 383 ms |
+| `metadata-only` | 0 B | 18,482 B | 0.01 ms | 181 ms |
+| all-same PNG *(reference)* | 14,620 B | 33,720 B | 182 ms | 364 ms |
+
+So `newest-detailed` costs about 57% less than sending every frame at the same
+settings, `newest-only` about 80% less, and a metadata-only response carries no
+pixels at all while still describing every frame. An overview plus two regions
+costs about **64%** of whole frames at the crops' own quality, while describing
+three views per frame instead of one.
+
+These are observations from one machine, not universal constants; run
+`cargo test --offline --test presentation_metrics -- --nocapture --test-threads=1`
+to reproduce them. What the tests *assert* is the ordering (each cheaper policy
+really is cheaper) and the structural claims, not the numbers.
+
+### Memory
+
+Views share one raw frame rather than copying it: `SessionFrame::frame` is an
+`Arc<Frame>`, and the presentation layer never constructs a `Frame`, so nine views
+over one frame cost one frame. Measured on a 640×480 screen (921,600 B per raw
+frame), presenting nine views of one retained frame and then doing it three more
+times produced **zero** further growth in the service's resident set. Raw frames are
+not duplicated, and cropping allocates no new frame ID — a `frame` request with nine
+views leaves `frames_captured` at 1.
+
+History capacity is unchanged by presentation (`--history` still bounds retention),
+and temporary encoded buffers are released when the response is sent.
+
+### Where the time goes
+
+Presented timing is kept separate from sampling timing, so a caller can distinguish
+*captured late* from *captured on time, delivered late*:
+
+```json
+"timing": {
+  "presentation_us": 4690, "crop_us_total": 120, "resize_us_total": 980,
+  "encode_us_total": 3100, "base64_us_total": 380, "budget_fit_us": 0
+}
+```
+
+Presentation cannot influence sampling. Sampling completes entirely before
+presentation begins, so the same request under a metadata-only policy and under a
+heavy multi-view policy with budget fitting captures the same number of frames, at
+the same cadence, with the same skips.
+
+### Presentation exit codes
+
+Two were added: `invalid_presentation_policy` (25) for a malformed or
+self-contradictory policy — a zero-sized region, a duplicate region name, a region
+named `overview`, a budget that requests nothing — refused before any capture, and
+`payload_budget_exceeded` (26) for a budget that cannot hold the required views.
+
 ## Testing
 
 ```bash
@@ -1289,7 +1479,43 @@ The suite covers, among other things:
   connection, a malformed request leaving the connection usable, close leaving the
   connection reusable, a clear error once the service stops, the simultaneous
   connection bound with `service_overloaded` beyond it, unique request IDs echoed
-  per response, and a client per concurrent caller.
+  per response, and a client per concurrent caller;
+* **presentation over Xvfb (Phase 6)**: an overview and a region verified pixel by
+  pixel against four quadrants painted in known colours, several regions returned
+  with independent sizes and formats in declared order, a region-only response
+  carrying no overview, out-of-bounds and zero-sized regions refused, and multiple
+  views of one frame reporting one frame ID and one capture moment — the same-frame
+  guarantee;
+* **the changed crop over Xvfb**: a known painted rectangle producing the exact
+  bounding box, padding widening the returned rectangle but not the factual one,
+  padding clamped at the source edge and the clamping visible, no change yielding no
+  crop at all, a sub-threshold change still yielding a crop while reporting
+  `changed: false`, a whole-screen change reported honestly, and a crop allocating no
+  new frame ID;
+* **presentation temporal policy over Xvfb**: all four modes compared on one live
+  scene, `all-same` rendering every frame identically, `newest-detailed` reducing the
+  older frames while the newest keeps its settings, `newest-only` leaving one frame
+  with pixels and still reporting the others, `metadata-older` keeping identity and
+  timing with no image, a metadata-only policy producing no pixels anywhere while
+  still describing every view, a static scene still yielding every requested frame,
+  and temporal order following the sampling order rather than numeric frame IDs;
+* **payload fitting over Xvfb**: an impossible budget refused as
+  `payload_budget_exceeded` with the floor quoted, a budget just above the floor
+  returning every captured frame, a generous budget leaving the presentation
+  untouched with `"fit": "exact"`, a tighter budget keeping every frame, the newest
+  protected until the older levers are spent, an optional region dropped while a
+  required one survives, and five repeated fits of the same raw frames producing an
+  identical presentation — determinism;
+* **timing isolation (Phase 6)**: one real-time request made twice, under a
+  metadata-only policy and under a heavy multi-view policy with budget fitting,
+  asserting the same frame count, outcome, cadence slots, skip count, interval, and
+  deadline — presentation cannot influence sampling — while presentation timing and
+  payload are shown to differ;
+* **presentation cost and memory metrics**: the four policies measured against one
+  live scene with the ordering asserted and the numbers printed, an overview plus
+  regions compared against whole frames at equal quality, and the memory claims
+  established by repeating a nine-view presentation and requiring the resident set to
+  settle at zero growth.
 
 The integration tests in `tests/observe_equivalence.rs`, `tests/session_concurrency.rs`,
 and `tests/realtime_x11.rs` hold a connection open for a whole scenario, because Xvfb
@@ -1305,13 +1531,15 @@ threshold to assert against. Run them with:
 ```bash
 cargo test --offline --test persistence_metrics -- --nocapture --test-threads=1
 cargo test --offline --test realtime_metrics -- --nocapture --test-threads=1
+cargo test --offline --test presentation_metrics -- --nocapture --test-threads=1
 ```
 
 What those tests *do* assert is the structural claim — that the persistent path
 really does avoid repeating connection setup, that history really is bounded, that
-encoding really does not occur inside a sampling window, and that skipped
-opportunities really are never replayed — because those are properties of this
-implementation rather than of the machine it runs on.
+encoding really does not occur inside a sampling window, that skipped
+opportunities really are never replayed, that the cheaper presentation policies
+really are cheaper, and that views really do share one raw frame — because those are
+properties of this implementation rather than of the machine it runs on.
 
 Integration tests start their own `Xvfb` and draw known colours onto it, then
 verify the captured pixels at the coordinates they were drawn at. That is what

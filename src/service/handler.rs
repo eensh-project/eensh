@@ -147,35 +147,62 @@ impl Handler {
                 Ok(ResponseBody::SessionClosed { session_id })
             }
 
-            Request::SessionCapture { session_id, output } => {
+            Request::SessionCapture {
+                session_id,
+                output,
+                presentation,
+            } => {
                 let handle = self.manager.get(&session_id)?;
                 let options = output.to_image_options()?;
-                let frame =
-                    session_pipeline::session_frame(&handle, FrameRequest::Capture, &options)?;
-                Ok(ResponseBody::Frame { frame })
+                let (frame, presentation) = session_pipeline::session_frame(
+                    &handle,
+                    FrameRequest::Capture,
+                    &options,
+                    presentation.as_deref(),
+                )?;
+                Ok(ResponseBody::Frame {
+                    frame: Box::new(frame),
+                    presentation: presentation.map(Box::new),
+                })
             }
 
-            Request::SessionLatest { session_id, output } => {
+            Request::SessionLatest {
+                session_id,
+                output,
+                presentation,
+            } => {
                 let handle = self.manager.get(&session_id)?;
                 let options = output.to_image_options()?;
-                let frame =
-                    session_pipeline::session_frame(&handle, FrameRequest::Latest, &options)?;
-                Ok(ResponseBody::Frame { frame })
+                let (frame, presentation) = session_pipeline::session_frame(
+                    &handle,
+                    FrameRequest::Latest,
+                    &options,
+                    presentation.as_deref(),
+                )?;
+                Ok(ResponseBody::Frame {
+                    frame: Box::new(frame),
+                    presentation: presentation.map(Box::new),
+                })
             }
 
             Request::SessionFrame {
                 session_id,
                 frame_id,
                 output,
+                presentation,
             } => {
                 let handle = self.manager.get(&session_id)?;
                 let options = output.to_image_options()?;
-                let frame = session_pipeline::session_frame(
+                let (frame, presentation) = session_pipeline::session_frame(
                     &handle,
                     FrameRequest::ById(frame_id),
                     &options,
+                    presentation.as_deref(),
                 )?;
-                Ok(ResponseBody::Frame { frame })
+                Ok(ResponseBody::Frame {
+                    frame: Box::new(frame),
+                    presentation: presentation.map(Box::new),
+                })
             }
 
             Request::SessionDiff {
@@ -183,6 +210,7 @@ impl Handler {
                 before,
                 after,
                 compare,
+                changed,
             } => {
                 let handle = self.manager.get(&session_id)?;
                 let options: crate::compare::CompareOptions = compare.into();
@@ -194,6 +222,30 @@ impl Handler {
                 };
                 let compare_us = stopwatch.elapsed_us();
 
+                // The changed-region view is cropped from the *newer* frame, which
+                // is the one the bounding box describes. Retrieving it by identity
+                // rather than re-capturing is what guarantees the crop shows the same
+                // moment the comparison described.
+                let changed_view = match changed {
+                    Some(policy) => {
+                        let newer = {
+                            let session = handle.lock().expect("session poisoned");
+                            session.frame(after)?
+                        };
+                        let presentable = crate::presentation::PresentableFrame {
+                            session_id: newer.session_id.clone(),
+                            frame_id: newer.frame_id,
+                            frame: Arc::clone(&newer.frame),
+                            captured_at: newer.captured_at,
+                            capture_offset: None,
+                            capture_duration: Some(newer.capture_duration),
+                        };
+                        crate::presentation::changed_region(&comparison, &presentable, &policy)?
+                            .map(crate::presentation::changed_to_response)
+                    }
+                    None => None,
+                };
+
                 Ok(ResponseBody::Diff {
                     diff: SessionDiffResponse {
                         session_id,
@@ -202,6 +254,7 @@ impl Handler {
                         comparison,
                         compare_us,
                     },
+                    changed_view,
                 })
             }
 
@@ -211,6 +264,7 @@ impl Handler {
                 temporal,
                 stable_for_ms,
                 output,
+                presentation: _,
             } => {
                 // `try_get` rather than `get`: only one observation may run per
                 // session, and a second is refused with an explicit error rather
@@ -243,7 +297,8 @@ impl Handler {
                 };
 
                 Ok(ResponseBody::Observation {
-                    observation: outcome.response,
+                    observation: Box::new(outcome.response),
+                    presentation: None,
                 })
             }
 
@@ -251,6 +306,7 @@ impl Handler {
                 session_id,
                 realtime,
                 output,
+                presentation,
             } => {
                 // `try_get` for the same reason as an observation: `realtime` is a
                 // temporal operation, and only one may run per session. A queued
@@ -262,12 +318,40 @@ impl Handler {
 
                 // Sampling first, entirely, and only then presentation. Nothing is
                 // encoded inside the sampling window, because that would stretch the
-                // interval the caller asked for.
+                // interval the caller asked for. This is the ordering the Phase 6
+                // specification calls critical (requirement 34): the presentation
+                // policy is applied to frames that have already been captured, and it
+                // cannot influence when they were taken.
                 let capture =
                     session_realtime::session_realtime(&handle, &realtime.into(), &clock)?;
+
+                let presentation = match presentation {
+                    Some(policy) => {
+                        let presentable: Vec<crate::presentation::PresentableFrame> = capture
+                            .samples
+                            .iter()
+                            .map(|sample| crate::presentation::PresentableFrame {
+                                session_id: sample.session_frame.session_id.clone(),
+                                frame_id: sample.session_frame.frame_id,
+                                frame: Arc::clone(&sample.session_frame.frame),
+                                captured_at: sample.session_frame.captured_at,
+                                capture_offset: Some(sample.capture_offset),
+                                capture_duration: Some(sample.capture_duration),
+                            })
+                            .collect();
+                        let presented = crate::presentation::present_stack(&presentable, &policy)?;
+                        let mode = policy.temporal.as_ref().map(|t| t.mode_name().to_string());
+                        Some(crate::presentation::to_response(&presented, mode))
+                    }
+                    None => None,
+                };
+
                 let response = capture.prepare(&options)?;
 
-                Ok(ResponseBody::Realtime { realtime: response })
+                Ok(ResponseBody::Realtime {
+                    realtime: Box::new(response),
+                    presentation: presentation.map(Box::new),
+                })
             }
         }
     }
@@ -387,6 +471,7 @@ mod tests {
         let response = handler.handle(envelope(Request::SessionCapture {
             session_id: "s-nope".to_string(),
             output,
+            presentation: None,
         }));
 
         // Session lookup happens first, so this asserts the ordering rather than
@@ -410,21 +495,25 @@ mod tests {
             Request::SessionCapture {
                 session_id: "s-1".to_string(),
                 output: default_image_options(),
+                presentation: None,
             },
             Request::SessionLatest {
                 session_id: "s-1".to_string(),
                 output: default_image_options(),
+                presentation: None,
             },
             Request::SessionFrame {
                 session_id: "s-1".to_string(),
                 frame_id: crate::session::FrameId(1),
                 output: default_image_options(),
+                presentation: None,
             },
             Request::SessionDiff {
                 session_id: "s-1".to_string(),
                 before: crate::session::FrameId(1),
                 after: crate::session::FrameId(2),
                 compare: crate::compare::CompareOptions::default().into(),
+                changed: None,
             },
             Request::SessionObserve {
                 session_id: "s-1".to_string(),
@@ -432,6 +521,7 @@ mod tests {
                 temporal: crate::observe::TemporalCompareOptions::default().into(),
                 stable_for_ms: 300,
                 output: default_image_options(),
+                presentation: None,
             },
         ];
 

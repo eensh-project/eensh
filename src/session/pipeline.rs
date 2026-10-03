@@ -12,6 +12,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::sync::Arc;
+
 use crate::compare::Comparison;
 use crate::error::Error;
 use crate::geometry::Transform;
@@ -85,11 +87,25 @@ impl FrameRequest {
 ///
 /// This is the single entry point behind `session capture`, `session latest`, and
 /// `session frame`, because all three differ only in where the frame comes from.
+///
+/// `presentation` is the Phase 6 policy. When it is `Some`, the raw frame is also
+/// rendered through it and the multi-view result is returned alongside the Phase 5
+/// response; when it is `None`, the Phase 5 path runs alone and nothing about the
+/// result changes. Keeping both in one function is what guarantees the two describe
+/// the *same* physical frame: there is exactly one capture here, and both outputs
+/// come from it (requirement 9).
 pub fn session_frame(
     handle: &SharedSession,
     request: FrameRequest,
     options: &ImageOptions,
-) -> Result<SessionFrameResponse, Error> {
+    presentation: Option<&crate::presentation::ObservationPolicy>,
+) -> Result<
+    (
+        SessionFrameResponse,
+        Option<crate::output::json::PresentationResponse>,
+    ),
+    Error,
+> {
     let mut ledger = SessionCaptureTiming::default();
 
     let session_frame = {
@@ -106,7 +122,27 @@ pub fn session_frame(
         }
     };
 
-    build_frame_response(session_frame, request, options, ledger)
+    // The presentation is built from the same `SessionFrame`, so it shares the one
+    // `Arc<Frame>` allocation rather than taking a second copy of the pixels
+    // (requirement 43).
+    let presentation = match presentation {
+        Some(policy) => {
+            let presentable = crate::presentation::PresentableFrame {
+                session_id: session_frame.session_id.clone(),
+                frame_id: session_frame.frame_id,
+                frame: Arc::clone(&session_frame.frame),
+                captured_at: session_frame.captured_at,
+                capture_offset: None,
+                capture_duration: Some(session_frame.capture_duration),
+            };
+            let presented = crate::presentation::present_frame(&presentable, policy)?;
+            Some(crate::presentation::to_response(&presented, None))
+        }
+        None => None,
+    };
+
+    let response = build_frame_response(session_frame, request, options, ledger)?;
+    Ok((response, presentation))
 }
 
 /// Prepare a captured or retrieved frame for output.

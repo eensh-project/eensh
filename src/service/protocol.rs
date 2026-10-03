@@ -79,6 +79,13 @@ pub enum Request {
         session_id: String,
         /// How to present the returned frame.
         output: ImageOptionsWire,
+        /// The Phase 6 presentation policy, when one was supplied.
+        ///
+        /// Absent means "Phase 5 behaviour": one whole-frame image, exactly as
+        /// before. That is what makes Phase 6 additive — a caller that knows nothing
+        /// about presentation sends nothing and gets what it always got.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<Box<crate::presentation::ObservationPolicy>>,
     },
 
     /// Return the newest retained frame without capturing.
@@ -87,6 +94,9 @@ pub enum Request {
         session_id: String,
         /// How to present the returned frame.
         output: ImageOptionsWire,
+        /// The Phase 6 presentation policy, when one was supplied.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<Box<crate::presentation::ObservationPolicy>>,
     },
 
     /// Return a specific retained frame.
@@ -97,6 +107,13 @@ pub enum Request {
         frame_id: FrameId,
         /// How to present the returned frame.
         output: ImageOptionsWire,
+        /// The Phase 6 presentation policy, when one was supplied.
+        ///
+        /// This is the path that makes re-presentation possible: any retained frame
+        /// can be rendered again under a different policy without allocating a new
+        /// frame identity (requirement 42).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<Box<crate::presentation::ObservationPolicy>>,
     },
 
     /// Compare two retained frames.
@@ -109,6 +126,9 @@ pub enum Request {
         after: FrameId,
         /// Comparison settings.
         compare: CompareOptionsWire,
+        /// How to deliver the changed region, when one was requested.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        changed: Option<crate::presentation::ChangedRegionPolicy>,
     },
 
     /// Run a temporal observation inside a session.
@@ -123,6 +143,9 @@ pub enum Request {
         stable_for_ms: u64,
         /// How to present the final frame.
         output: ImageOptionsWire,
+        /// The Phase 6 presentation policy, when one was supplied.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<Box<crate::presentation::ObservationPolicy>>,
     },
 
     /// Capture a bounded real-time temporal stack from a session.
@@ -138,6 +161,9 @@ pub enum Request {
         realtime: RealtimeWire,
         /// How to present every returned frame.
         output: ImageOptionsWire,
+        /// The Phase 6 presentation policy, when one was supplied.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<Box<crate::presentation::ObservationPolicy>>,
     },
 }
 
@@ -487,6 +513,12 @@ impl ErrorBody {
 }
 
 /// The successful response body, one variant per method.
+///
+/// Several variants carry a `Box`ed payload. That is not incidental: a response
+/// carrying a multi-view presentation is an order of magnitude larger than a status
+/// reply, and without the indirection every `ResponseBody` — including a one-field
+/// ping answer — would be sized for the largest one. Boxing keeps the common case
+/// cheap and makes the size of the rare case explicit at the point it is built.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResponseBody {
@@ -520,22 +552,42 @@ pub enum ResponseBody {
     /// Answer to a frame request.
     Frame {
         /// The frame result.
-        frame: crate::session::pipeline::SessionFrameResponse,
+        frame: Box<crate::session::pipeline::SessionFrameResponse>,
+        /// The Phase 6 multi-view presentation, when a policy was supplied.
+        ///
+        /// Absent entirely when no policy was supplied, which is what keeps the
+        /// Phase 5 response shape unchanged rather than merely equivalent.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<Box<crate::output::json::PresentationResponse>>,
     },
     /// Answer to [`Request::SessionDiff`].
     Diff {
         /// The comparison result.
         diff: crate::session::pipeline::SessionDiffResponse,
+        /// The changed-region view, when one was requested.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        changed_view: Option<crate::output::json::ChangedRegionResponse>,
     },
     /// Answer to [`Request::SessionObserve`].
     Observation {
         /// The observation result.
-        observation: crate::output::json::ObservationResponse,
+        observation: Box<crate::output::json::ObservationResponse>,
+        /// The Phase 6 multi-view presentation of the final frame, when a policy was
+        /// supplied.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<Box<crate::output::json::PresentationResponse>>,
     },
     /// Answer to [`Request::SessionRealtime`].
     Realtime {
         /// The temporal stack and its timing.
-        realtime: crate::session::realtime::RealtimeResponse,
+        realtime: Box<crate::session::realtime::RealtimeResponse>,
+        /// The Phase 6 multi-view presentation, when a policy was supplied.
+        ///
+        /// Carried *alongside* the Phase 5 response rather than replacing it, so the
+        /// sampling metadata — offsets, skips, ages, sampling timing — stays exactly
+        /// where a Phase 5 caller looks for it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        presentation: Option<Box<crate::output::json::PresentationResponse>>,
     },
 }
 
@@ -751,6 +803,7 @@ mod tests {
             Request::SessionCapture {
                 session_id: "s-1".to_string(),
                 output: ImageOptionsWire::default_png_base64(),
+                presentation: None,
             },
         );
 
@@ -829,6 +882,7 @@ mod tests {
         let capture = Request::SessionCapture {
             session_id: "s-9".to_string(),
             output: ImageOptionsWire::default_png_base64(),
+            presentation: None,
         };
         assert_eq!(capture.method(), "session_capture");
         assert_eq!(capture.session_id(), Some("s-9"));

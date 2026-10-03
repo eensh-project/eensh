@@ -137,6 +137,181 @@ impl InputDescription {
     }
 }
 
+// ============================================================================
+// Phase 6: efficient agent observation
+// ============================================================================
+//
+// These types are additive. Nothing above changed shape, and a Phase 1-5 caller
+// that never mentions `views` or `presentation` sees exactly the response it saw
+// before (requirement 37).
+
+/// One rendered view of a frame: an overview, a named region, or a changed crop.
+///
+/// The `source_rect` is in **source coordinates**, and it is what the returned
+/// image's pixels map back through. A crop of a window at source `(100, 200)`
+/// reports the source rectangle, not the frame-local one, so a caller never has to
+/// reconstruct where a region came from (requirement 7).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewResponse {
+    /// The view's name: `overview`, a caller-supplied region name, or `changed`.
+    pub name: String,
+    /// What kind of view this is.
+    pub kind: String,
+    /// The source-space rectangle this view was rendered from.
+    pub source_rect: crate::geometry::Rect,
+    /// Mapping from view pixels back to source pixels.
+    pub transform: Transform,
+    /// The image, or `None` for a metadata-only view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<ObservedFrame>,
+    /// The presentation settings actually applied, after any budget fitting.
+    pub applied: AppliedImagePolicy,
+}
+
+/// The presentation settings actually used for a view.
+///
+/// Reported separately from what was requested so that a caller can always tell
+/// whether it got what it asked for, and so a budget adjustment is visible in the
+/// view itself rather than only in the fit report (requirement 23).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedImagePolicy {
+    /// Output format actually used.
+    pub format: String,
+    /// JPEG quality actually used, when the format has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality: Option<u8>,
+    /// Width actually used, when the view was resized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Whether the image was embedded inline.
+    pub base64: bool,
+    /// Whether the view carries no image at all.
+    pub metadata_only: bool,
+}
+
+/// One frame's presentation inside a multi-view response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresentedFrameResponse {
+    /// The frame's session identity.
+    pub frame_id: crate::session::FrameId,
+    /// When the sample was taken, from the request start. Temporal only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_offset_us: Option<u64>,
+    /// How long the capture took. Temporal only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_duration_us: Option<u64>,
+    /// How long ago the frame was captured, when the response was assembled.
+    pub age_us: u64,
+    /// The views, overview first, then regions in declared order.
+    pub views: Vec<ViewResponse>,
+    /// Total encoded bytes across this frame's views.
+    pub encoded_bytes: usize,
+    /// Total base64 bytes across this frame's views.
+    pub base64_bytes: usize,
+}
+
+impl PresentedFrameResponse {
+    /// The overview view, if there is one.
+    pub fn overview(&self) -> Option<&ViewResponse> {
+        self.views.iter().find(|view| view.kind == "overview")
+    }
+
+    /// A named region view.
+    pub fn region(&self, name: &str) -> Option<&ViewResponse> {
+        self.views
+            .iter()
+            .find(|view| view.kind == "region" && view.name == name)
+    }
+
+    /// Whether any view on this frame carries an image.
+    pub fn has_images(&self) -> bool {
+        self.views.iter().any(|view| view.image.is_some())
+    }
+}
+
+/// What the payload budget fitter did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PayloadSection {
+    /// The budget the caller set, in base64 bytes.
+    pub budget_base64_bytes: usize,
+    /// What the visual payload actually came to, in base64 bytes.
+    pub actual_base64_bytes: usize,
+    /// `exact` or `adjusted`.
+    pub fit: String,
+    /// Every change the fitter made.
+    pub adjustments: Vec<crate::presentation::PayloadAdjustment>,
+}
+
+/// Where the presentation time went.
+///
+/// Kept separate from the sampling timing so a caller can distinguish *captured
+/// late* from *captured on time, delivered late* (requirement 35).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresentationTimingSection {
+    /// Total time in the presentation phase.
+    pub presentation_us: u64,
+    /// Time spent cropping regions out of raw frames.
+    pub crop_us_total: u64,
+    /// Time spent resizing.
+    pub resize_us_total: u64,
+    /// Time spent encoding.
+    pub encode_us_total: u64,
+    /// Time spent base64 encoding.
+    pub base64_us_total: u64,
+    /// Time spent in the budget fitting loop, including re-encodes.
+    pub budget_fit_us: u64,
+}
+
+/// A multi-view presentation of one or more frames.
+///
+/// This is the Phase 6 addition to the capture and retrieval responses. It is
+/// attached as `presentation` and is absent entirely when no policy was supplied,
+/// which is what keeps the Phase 5 output byte-for-byte unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresentationResponse {
+    /// One entry per frame, oldest first.
+    pub frames: Vec<PresentedFrameResponse>,
+    /// What the budget fitter did, when a budget was set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<PayloadSection>,
+    /// Where the presentation time went.
+    pub timing: PresentationTimingSection,
+    /// Total encoded bytes across every view.
+    pub total_encoded_bytes: usize,
+    /// Total base64 bytes across every view.
+    pub total_base64_bytes: usize,
+    /// The temporal policy mode that was applied, when there was one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporal_mode: Option<String>,
+}
+
+impl PresentationResponse {
+    /// The newest frame's presentation.
+    pub fn newest(&self) -> Option<&PresentedFrameResponse> {
+        self.frames.last()
+    }
+
+    /// The single frame's presentation, for a non-temporal request.
+    pub fn frame(&self) -> Option<&PresentedFrameResponse> {
+        self.frames.first()
+    }
+}
+
+/// A changed-region view and the comparison that produced it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChangedRegionResponse {
+    /// The factual Phase 2 bounding box, before padding.
+    pub raw_changed_rect: crate::geometry::Rect,
+    /// The rectangle actually returned, after padding and clamping.
+    pub returned_rect: crate::geometry::Rect,
+    /// The padding that was requested.
+    pub padding: u32,
+    /// Whether the change was large enough that the policy returned the whole frame.
+    pub fell_back_to_overview: bool,
+    /// The rendered view.
+    pub view: ViewResponse,
+}
+
 /// Describes a crop of the second frame that was written to disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedCrop {

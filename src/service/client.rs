@@ -176,20 +176,24 @@ fn build_request(command: &SessionCommand) -> Result<RequestEnvelope, Error> {
             session_id,
             image,
             base64,
+            presentation,
             ..
         } => Request::SessionCapture {
             session_id: session_id.clone(),
             output: to_wire(image, *base64)?,
+            presentation: presentation.resolve()?.map(Box::new),
         },
 
         SessionCommand::Latest {
             session_id,
             image,
             base64,
+            presentation,
             ..
         } => Request::SessionLatest {
             session_id: session_id.clone(),
             output: to_wire(image, *base64)?,
+            presentation: presentation.resolve()?.map(Box::new),
         },
 
         SessionCommand::Frame {
@@ -197,17 +201,20 @@ fn build_request(command: &SessionCommand) -> Result<RequestEnvelope, Error> {
             frame_id,
             image,
             base64,
+            presentation,
             ..
         } => Request::SessionFrame {
             session_id: session_id.clone(),
             frame_id: FrameId(*frame_id),
             output: to_wire(image, *base64)?,
+            presentation: presentation.resolve()?.map(Box::new),
         },
 
         SessionCommand::Diff {
             session_id,
             before,
             after,
+            presentation,
             ..
         } => {
             let compare = command.diff_compare_options()?.ok_or_else(|| {
@@ -218,6 +225,15 @@ fn build_request(command: &SessionCommand) -> Result<RequestEnvelope, Error> {
                 before: FrameId(*before),
                 after: FrameId(*after),
                 compare: compare.into(),
+                changed: presentation
+                    .resolve()?
+                    .and_then(|policy| policy.changed)
+                    .map(|mut changed| {
+                        // A changed view is required by default; the CLI flag exists so a
+                        // caller can be explicit rather than to make it optional.
+                        changed.required = true;
+                        changed
+                    }),
             }
         }
 
@@ -227,6 +243,7 @@ fn build_request(command: &SessionCommand) -> Result<RequestEnvelope, Error> {
             temporal: args.temporal()?.into(),
             stable_for_ms: 0,
             output: to_wire(&args.image, args.base64)?,
+            presentation: None,
         },
 
         SessionCommand::WaitStable(args) => Request::SessionObserve {
@@ -235,6 +252,7 @@ fn build_request(command: &SessionCommand) -> Result<RequestEnvelope, Error> {
             temporal: args.temporal()?.into(),
             stable_for_ms: args.stable_for(ObservationKind::WaitStable).as_millis() as u64,
             output: to_wire(&args.image, args.base64)?,
+            presentation: None,
         },
 
         SessionCommand::Observe(args) => Request::SessionObserve {
@@ -243,12 +261,14 @@ fn build_request(command: &SessionCommand) -> Result<RequestEnvelope, Error> {
             temporal: args.temporal()?.into(),
             stable_for_ms: args.stable_for(ObservationKind::Observe).as_millis() as u64,
             output: to_wire(&args.image, args.base64)?,
+            presentation: None,
         },
 
         SessionCommand::Realtime(args) => Request::SessionRealtime {
             session_id: args.session_id.clone(),
             realtime: args.options()?.into(),
             output: to_wire(&args.image, args.base64)?,
+            presentation: args.presentation.resolve()?.map(Box::new),
         },
     };
 
@@ -327,7 +347,7 @@ fn emit(response: &ResponseEnvelope, json: bool) -> i32 {
     // Checked before rendering, because a timeout is not a transport failure.
     let timed_out = matches!(
         result,
-        ResponseBody::Observation { observation }
+        ResponseBody::Observation { observation, .. }
             if observation.observation.result == Outcome::Timeout
     );
 
@@ -432,16 +452,34 @@ fn summarize(result: &ResponseBody) -> String {
             info.history.retained_bytes
         ),
         ResponseBody::SessionClosed { session_id } => format!("closed session {session_id}"),
-        ResponseBody::Frame { frame } => format!(
-            "frame {} ({}) {}x{} age={}us fresh_capture={}",
-            frame.frame_id,
-            frame.image.media_type,
-            frame.image.width,
-            frame.image.height,
-            frame.frame_age_us,
-            frame.fresh_capture
-        ),
-        ResponseBody::Diff { diff } => format!(
+        ResponseBody::Frame {
+            frame,
+            presentation,
+        } => {
+            let views = match presentation {
+                Some(presentation) if presentation.total_base64_bytes > 0 => format!(
+                    ", {} view(s) {} bytes",
+                    presentation
+                        .frames
+                        .iter()
+                        .map(|f| f.views.len())
+                        .sum::<usize>(),
+                    presentation.total_base64_bytes
+                ),
+                _ => String::new(),
+            };
+            format!(
+                "frame {} ({}) {}x{} age={}us fresh_capture={}{}",
+                frame.frame_id,
+                frame.image.media_type,
+                frame.image.width,
+                frame.image.height,
+                frame.frame_age_us,
+                frame.fresh_capture,
+                views
+            )
+        }
+        ResponseBody::Diff { diff, .. } => format!(
             "{} vs {}: changed={} {}/{} pixels ({:.4}%) in {}us",
             diff.before,
             diff.after,
@@ -451,7 +489,7 @@ fn summarize(result: &ResponseBody) -> String {
             diff.comparison.changed_fraction * 100.0,
             diff.compare_us
         ),
-        ResponseBody::Observation { observation } => {
+        ResponseBody::Observation { observation, .. } => {
             let section = &observation.observation;
             let frames = observation
                 .frames
@@ -467,10 +505,31 @@ fn summarize(result: &ResponseBody) -> String {
                 section.kind, section.result, section.captures, section.elapsed_ms, frames
             )
         }
-        ResponseBody::Realtime { realtime } => {
+        ResponseBody::Realtime {
+            realtime,
+            presentation,
+        } => {
             let summary = &realtime.realtime;
+            let extra = match presentation {
+                Some(presentation) => {
+                    if presentation.total_base64_bytes > 0 {
+                        format!(
+                            ", presented {} view(s) in {} bytes",
+                            presentation
+                                .frames
+                                .iter()
+                                .map(|f| f.views.len())
+                                .sum::<usize>(),
+                            presentation.total_base64_bytes
+                        )
+                    } else {
+                        String::new()
+                    }
+                }
+                None => String::new(),
+            };
             format!(
-                "realtime {}: {}/{} frames, {} skipped, {}ms sampling, {} frames {}x{}",
+                "realtime {}: {}/{} frames, {} skipped, {}ms sampling, {} frames {}x{}{}",
                 summary.result,
                 summary.captured_frames,
                 summary.requested_frames,
@@ -478,7 +537,8 @@ fn summarize(result: &ResponseBody) -> String {
                 summary.elapsed_ms,
                 realtime.frames.len(),
                 realtime.source.width,
-                realtime.source.height
+                realtime.source.height,
+                extra
             )
         }
     }
@@ -636,6 +696,7 @@ mod tests {
         let envelope = build_request(&SessionCommand::Capture {
             session_id: "s-1".to_string(),
             image: image_args(),
+            presentation: Default::default(),
             base64: true,
             json: true,
             socket: None,
@@ -652,6 +713,7 @@ mod tests {
             session_id: "s-1".to_string(),
             frame_id: 1842,
             image: image_args(),
+            presentation: Default::default(),
             base64: false,
             json: true,
             socket: None,
@@ -673,6 +735,7 @@ mod tests {
             mode: None,
             pixel_threshold: None,
             area_threshold: None,
+            presentation: Default::default(),
             json: true,
             socket: None,
         })

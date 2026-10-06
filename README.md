@@ -138,8 +138,7 @@ just another X11 display.
 | `--height N` | Resize to a height, preserving the aspect ratio. |
 | `--scale F` | Resize by a uniform factor. |
 
-`--width`, `--height`, and `--scale` are mutually exclusive. Phase 1 only does
-proportional resizing, so combining `--width` and `--height` is rejected rather
+`--width`, `--height`, and `--scale` are mutually exclusive. Combining `--width` and `--height` is rejected rather
 than silently distorting the image.
 
 ### Output options
@@ -351,7 +350,7 @@ invent a placeholder image.
 
 `compare_frames` works on raw frames. The `diff` command decodes its inputs at the
 boundary because files are what a human hands it, but the engine itself never sees
-a PNG or a JPEG. That is what lets Phase 3 call it on live captures at high
+a PNG or a JPEG. That is what lets it take live captures at high
 frequency. There is a benchmark:
 
 ```bash
@@ -500,10 +499,6 @@ Are we slow because comparison is slow?  -> compare_us_total
 Are we mostly sleeping between polls?    -> sleep_us_total
 ```
 
-`capture_us_total` is often the dominant term, and this is expected: each sample
-opens its own X11 connection. That is a deliberate Phase 3 simplification —
-Phase 4 exists to amortise it without changing any of these semantics. The numbers
-are reported rather than hidden so the cost stays visible.
 
 ### Semantics worth knowing
 
@@ -536,10 +531,6 @@ timer.
 origin, not against the end of the previous sample. A slow capture does not push
 every subsequent sample later; missed opportunities are skipped rather than
 queued, so the observer always works from fresh frames.
-
-**Capture failures abort the observation** with the underlying structured error.
-Phase 3 does not retry; a transient-failure policy belongs with the persistent
-session in Phase 4.
 
 ### Observation output routing
 
@@ -606,7 +597,7 @@ Two things are worth knowing when reading those numbers:
   a given server. On a local X.Org or Xvfb display the handshake is sub-millisecond;
   some Xvfb builds (for example snap-packaged ones) spend tens of milliseconds
   there, which affects every X client equally. `eensh` cannot make the handshake
-  faster, and later phases will amortise it with a persistent connection rather
+  faster, and so sessions use a persistent connection rather
   than by micro-optimising this path.
 * **Resize and encode are linear in pixel count** and are reported separately, so
   it is easy to see which stage to attack.
@@ -655,7 +646,7 @@ optional base64      output/        text carrying those exact bytes
 JSON / file / stdout output/        presentation
 ```
 
-Phase 4 adds a persistent session without adding a fifth flow. A session is a
+Persistent sessions are now available - a session is a
 `FrameSource` like any other, so the observation state machine is *unchanged* and
 reused verbatim:
 
@@ -736,9 +727,7 @@ The obvious workaround — a non-blocking listener retried in a loop with a shor
 sleep between attempts — is worse than the problem, and measurably so. Every
 incoming connection then waits up to the whole sleep interval just to be
 accepted, which turned a trivially cheap request into a multi-millisecond one and
-made the persistent path *slower* than starting a fresh process. That is the exact
-opposite of the point of Phase 4, and it is why the measurement is a test rather
-than a note.
+made the persistent path *slower* than starting a fresh process.
 
 `poll` blocks until either a connection arrives or the timeout elapses, so a
 connection is accepted immediately while shutdown is still noticed inside one
@@ -901,8 +890,7 @@ open-ended.
 
 **No capture buffers are reused.** Frames are retained in history, so each must
 own its pixels; a reused buffer would be overwritten by the next capture while
-history still referred to it. The Phase 4 saving is connection reuse, and the
-allocation saved is the per-capture connection state rather than the pixel buffer.
+history still referred to it.
 
 ## Real-time observation
 
@@ -1181,8 +1169,8 @@ total is exactly four of them. The stack's other four frames are released when t
 operation ends. Two concurrent six-frame stacks in separate sessions hold their own
 frames independently (5,529,600 B each) and neither is left unusable afterwards.
 
-**No capture buffers are reused here either**, for the same reason as Phase 4: a
-frame that is retained, or that belongs to a returned stack, must own its pixels.
+**No capture buffers are reused here either**: a frame that is retained, or that 
+belongs to a returned stack, must own its pixels.
 
 ### No new exit codes
 
@@ -1213,9 +1201,7 @@ capture / observe / realtime
 
 Nothing in the presentation layer captures, compares, schedules, or touches history.
 It is handed frames that already exist and decides how to render them, which is what
-lets one raw observation produce several alternative presentations, and what keeps
-Phase 6 from quietly changing Phase 1–5 semantics. **With no presentation flags, the
-output is byte-for-byte what it was before Phase 6.**
+lets one raw observation produce several alternative presentations.
 
 ### Overview plus ROI
 
@@ -1249,7 +1235,7 @@ For a real-time stack, `--temporal` says how each frame should be treated:
 
 | Mode | Effect |
 |---|---|
-| `all-same` | Every frame identically. The Phase 5 behaviour. |
+| `all-same` | Every frame identically. |
 | `newest-detailed` | Older frames reduced, the newest preserved. |
 | `newest-only` | Only the newest carries image bytes. |
 | `metadata-older` | Older frames keep identity and timing, no image. |
@@ -1306,14 +1292,14 @@ the order a hash map happened to yield. The fitted plan is itself a comparable v
 
 ### The changed crop
 
-For `diff`, `--changed-region` returns the Phase 2 bounding box as a view, cropped
+For `diff`, `--changed-region` returns a bounding box as a view, cropped
 from the **newer** frame. `--changed-padding` widens it, clamped at the source edges;
 the factual `raw_changed_rect` and the `returned_rect` are reported separately so a
 change at the screen edge is never mistaken for a large one.
 
 A changed crop is *required* by default — a caller that asked for it asked for a
 reason — and `--changed-optional` opts into treating it as expendable. Note that
-Phase 2's two answers stay distinct: `bounding_box` is a fact about pixels, `changed`
+two answers stay distinct: `bounding_box` is a fact about pixels, `changed`
 is a policy verdict about area. A sub-threshold change has an empty verdict and a
 real bounding box, and a requested crop is still returned for it.
 
@@ -1421,13 +1407,11 @@ The suite covers, among other things:
   threshold, stability withheld while painting continues, a transition settling on
   the final state, a scene returning to baseline, and the timeout status for each
   of the three commands;
-* **observation equivalence (Phase 4)**: the same scripted scenes — static, one
+* **observation equivalence**: the same scripted scenes — static, one
   change, return to baseline, gradual drift, repeated settling — run through both
   the standalone and the persistent-session paths, asserting the two reach the
   same conclusion *and* that a path is reproducible across runs. Frame IDs and
   capture counts are deliberately not compared; the semantic result is.
-  This is the strongest protection against Phase 4 quietly changing behaviour
-  while optimising it;
 * **frame history**: identifiers, monotonicity, capacity boundaries, eviction and
   repeated eviction, capacity 1, invalid capacity, a retained frame staying alive
   while an operation holds it, and identifiers not being reused after eviction;
@@ -1453,7 +1437,7 @@ The suite covers, among other things:
   capture cost, history bounded by capacity with retained bytes equal to retained
   frames times the frame size, retained bytes unchanged by repeated retrievals, and
   the IPC round trip measured in isolation;
-* **real-time sampling (Phase 5), synthetic**: the schedule as a pure function —
+* **real-time sampling, synthetic**: the schedule as a pure function —
   exact sample offsets at a fixed origin, skips never replayed, a capture that
   overruns its slot, a cadence faster than capture, the timeout gating the *start*
   of a capture, a partial stack under an impossible deadline, a single-frame stack,
@@ -1480,7 +1464,7 @@ The suite covers, among other things:
   connection reusable, a clear error once the service stops, the simultaneous
   connection bound with `service_overloaded` beyond it, unique request IDs echoed
   per response, and a client per concurrent caller;
-* **presentation over Xvfb (Phase 6)**: an overview and a region verified pixel by
+* **presentation over Xvfb**: an overview and a region verified pixel by
   pixel against four quadrants painted in known colours, several regions returned
   with independent sizes and formats in declared order, a region-only response
   carrying no overview, out-of-bounds and zero-sized regions refused, and multiple
@@ -1506,7 +1490,7 @@ The suite covers, among other things:
   protected until the older levers are spent, an optional region dropped while a
   required one survives, and five repeated fits of the same raw frames producing an
   identical presentation — determinism;
-* **timing isolation (Phase 6)**: one real-time request made twice, under a
+* **timing isolation**: one real-time request made twice, under a
   metadata-only policy and under a heavy multi-view policy with budget fitting,
   asserting the same frame count, outcome, cadence slots, skip count, interval, and
   deadline — presentation cannot influence sampling — while presentation timing and
@@ -1546,43 +1530,3 @@ verify the captured pixels at the coordinates they were drawn at. That is what
 makes them meaningful rather than smoke tests. The temporal tests paint from a
 background thread while the observation runs, so the scene really does change
 underneath the observer.
-
-## Scope
-
-Implemented:
-
-* **Phase 1** — capture a desktop, region, or window; PNG and JPEG; resizing;
-  base64; structured JSON with an explicit coordinate transform; timing.
-* **Phase 2** — raw-frame comparison with exact and thresholded RGB modes, pixel
-  and area thresholds, changed-pixel counts, changed fraction, and a bounding box;
-  plus a `diff` command for comparing saved images.
-* **Phase 3** — temporal observation: `wait-change`, `wait-stable`, and `observe`,
-  with configurable thresholds, cadence, timeout, and stability duration; a
-  library API over a `FrameSource` seam; and per-stage observation timing.
-* **Phase 4** — a persistent capture service: `eensh serve` over a local Unix
-  socket, sessions that hold a display open, monotonic frame IDs, a bounded raw
-  frame history, retrieval and comparison of retained frames without touching
-  the display, observation inside a session using the unchanged Phase 3 state
-  machines, and a `eensh session` client.
-* **Phase 5** — real-time observation: `session realtime` for a bounded temporal
-  stack of 1–8 fresh frames at a fixed-origin cadence, with explicit sampling
-  timing, skipped-opportunity accounting, partial results under a short deadline,
-  per-frame ages, and a reusable long-lived client (`eensh::client`) over one
-  connection, plus a bound on simultaneous service connections.
-
-Deliberately **not** implemented, and reserved for later phases: ignore masks,
-named regions, connected-component segmentation, tile summaries, perceptual
-hashes, optical flow, adaptive payload selection, multi-region observation, a
-network service, input injection, and Wayland support. Also deliberately deferred:
-XDamage (both Phase 4 and Phase 5 still poll, per the Phase 3 cadence) and MIT-SHM
-(capture goes through the ordinary X11 path). There is no push notification: a
-caller asks for a stack and waits, rather than subscribing to a stream. Disk
-persistence of frames: history lives in memory and is deliberately not written
-anywhere. See `specs/` for the roadmap.
-
-The one thing Phase 3 is *bad* at is per-sample connection cost: every sample opens
-its own X11 connection. Phase 4 amortises that, without changing any of the
-semantics above — which is exactly what the equivalence tests are there to
-establish. Phase 5 does not change the sampling semantics either: it composes the
-Phase 3 `Clock`, the Phase 1 image preparation, and the Phase 4 session history,
-and adds only the schedule.

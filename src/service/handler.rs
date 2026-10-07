@@ -2,8 +2,8 @@
 //!
 //! The handler is where a request meets the existing machinery. It contains
 //! routing and a little policy, and no capture, comparison, or observation logic
-//! of its own: those are reached through [`CaptureSession`], [`crate::compare`],
-//! and [`crate::observe`] unchanged.
+//! of its own: those are reached through [`CaptureSession`][crate::session::CaptureSession],
+//! [`crate::compare`], and [`crate::observe`] unchanged.
 //!
 //! The service owns exactly one [`SessionManager`]. Sessions are shared handles,
 //! so a long observation in one session never blocks a capture in another.

@@ -67,6 +67,16 @@ Five things are unusually painful when a *program* takes screenshots:
 ## Installation
 
 ```bash
+cargo install eensh
+```
+
+This installs the `eensh` command. The crate also contains `compare_bench`, a
+development benchmark, which is behind a feature flag and is not installed by
+default.
+
+Or build from source:
+
+```bash
 cargo build --release
 install -m 755 target/release/eensh /usr/local/bin/eensh
 ```

@@ -25,11 +25,32 @@ readme = "README.md"
 keywords = ["screenshot", "x11", "agent", "capture", "automation"]
 categories = ["command-line-utilities", "multimedia::images"]
 
+# Build the API documentation for the same feature set that ships, and make
+# cross-crate links resolve on docs.rs. The crate exposes a library as well as
+# the `eensh` binary, so the published documentation is the library reference;
+# it is served from docs.rs rather than from a separate `documentation` URL.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 # `debian/` is excluded from the published crate but is tracked in git: it is
 # the Debian packaging, which is built from the source tree rather than from
 # the crate. `specs/` and `scripts/` are development material; `www/` is the
 # documentation site, which is not part of this package.
 exclude = ["debian/", "specs/", "scripts/", "www/", "dist/", "target/"]
+
+[features]
+# Gates the `compare_bench` diagnostic binary, which measures raw comparison
+# cost at representative frame sizes. It is a development tool rather than part
+# of the product, and without this gate `cargo install eensh` would place it in
+# the user's PATH alongside the `eensh` command. Run it with
+# `cargo run --release --bin compare_bench --features bench`.
+bench = []
+
+[[bin]]
+name = "compare_bench"
+path = "src/bin/compare_bench.rs"
+required-features = ["bench"]
 
 [dependencies]
 # Command line interface.

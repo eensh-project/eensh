@@ -30,7 +30,7 @@
 //! [`sample_stack`] captures, records timing, and nothing else. Encoding happens
 //! afterwards, in the pipeline, because encoding between captures would distort the
 //! very cadence the operation exists to report — see the note on
-//! [`RealtimeCapture`].
+//! [`crate::session::realtime::RealtimeCapture`].
 
 use std::time::Duration;
 

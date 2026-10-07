@@ -4,10 +4,32 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Fast, deterministic X11 screenshot capture utility designed for software agents"
+authors = ["David MacDonald <mindlapse@gmail.com>"]
+
+# Dual-licensed under either MIT or Apache-2.0, at the user's option — the
+# arrangement Rust projects conventionally use. `license` is the SPDX
+# expression that consumers and packaging tools read.
+#
+# The two licence texts are in LICENSE-MIT and LICENSE-APACHE, and COPYRIGHT
+# states which is which. They are *not* referenced from here: Cargo includes
+# every file named `LICENSE*` in the package automatically, and setting
+# `license-file` as well would only produce "only one of `license` or
+# `license-file` is necessary", since the licence already has a standard SPDX
+# expression.
 license = "MIT OR Apache-2.0"
+
+# Read by the packaging metadata check, which warns when this is absent.
+repository = "https://github.com/eensh-project/eensh"
+
 readme = "README.md"
 keywords = ["screenshot", "x11", "agent", "capture", "automation"]
 categories = ["command-line-utilities", "multimedia::images"]
+
+# `debian/` is excluded from the published crate but is tracked in git: it is
+# the Debian packaging, which is built from the source tree rather than from
+# the crate. `specs/` and `scripts/` are development material; `www/` is the
+# documentation site, which is not part of this package.
+exclude = ["debian/", "specs/", "scripts/", "www/", "dist/", "target/"]
 
 [dependencies]
 # Command line interface.
